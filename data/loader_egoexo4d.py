@@ -10,10 +10,12 @@ class EgoExo4DDataLoader(Dataset):
                 split='train',
                 duration=20,
                 hop_length=10,
+                use_audio=True,
                 fps=30):
         self.split = split
         self.duration = duration
         self.hop_length = hop_length
+        self.use_audio = use_audio
         self.fps = fps
         self.base_path = '/private/home/arjunrs1/egoexo4d_features'
         self.vid_feat_rel_path = "checkpoint/yalesong/EgoExo4D_EgoVLPv2_arxivC/extracted_features_egovlp2/EgoVLPv2_Pretraining_bs512-lr3e_5-Ep20"
@@ -82,7 +84,8 @@ class EgoExo4DDataLoader(Dataset):
         
         #Load audio features
         full_audio_features = np.load(os.path.join(self.audio_feature_path, f"{take_exo_id}.npy"))
-        audio_features = torch.from_numpy(full_audio_features[start_sec:end_sec]).float()
+        if self.use_audio:
+            audio_features = torch.from_numpy(full_audio_features[start_sec:end_sec]).float()
         
         # Load narration features
         narration_features = [torch.load(os.path.join(self.narration_feature_path, video_id, f"{nid}.pt")) for nid in narration_ids if nid]
@@ -117,15 +120,17 @@ class EgoExo4DDataLoader(Dataset):
             narration_padding_mask[:len(narration_features)] = 0
         
         metadata = {"narrations": narration_texts, "video_id": video_id, "exo_camera": exo_cam, "start_sec": start_sec}
-        a = {
+        output_dict = {
             'video_features': video_features.squeeze(1),
             "video_padding_mask": torch.zeros(video_features.size(0), dtype=torch.bool),
-            'audio_features': audio_features.squeeze(1),
-            "audio_padding_mask": torch.zeros(audio_features.size(0), dtype=torch.bool),
             'narration_features': padded_narration_features.squeeze(1),
             'narration_padding_mask': narration_padding_mask,
             'starts': padded_starts.squeeze(1),
             'ends': padded_ends.squeeze(1),
             'metadata' : metadata
         }
-        return a
+        if self.use_audio:
+            output_dict['audio_padding_mask'] = torch.zeros(audio_features.size(0), dtype=torch.bool)
+            output_dict['audio_features'] = audio_features.squeeze(1)
+
+        return output_dict

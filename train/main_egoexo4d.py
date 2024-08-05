@@ -42,8 +42,12 @@ def train(loader, model, optimizer, lr_scheduler, grad_scaler, device, epoch, ar
 
         video_seq = input_data['video_features'].to(device, non_blocking=True)
         video_padding_mask = input_data['video_padding_mask'].to(device, non_blocking=True)
-        audio_seq = input_data['audio_features'].to(device, non_blocking=True)
-        audio_padding_mask = input_data['audio_padding_mask'].to(device, non_blocking=True)
+        if 'audio_features' in input_data.keys():
+            audio_seq = input_data['audio_features'].to(device, non_blocking=True)
+            audio_padding_mask = input_data['audio_padding_mask'].to(device, non_blocking=True).bool()
+        else:
+            audio_seq = None
+            audio_padding_mask = None
         text_embed =  input_data['narration_features'].to(device, non_blocking=True)
         text_padding_mask = input_data['narration_padding_mask'].to(device, non_blocking=True)
 
@@ -55,7 +59,7 @@ def train(loader, model, optimizer, lr_scheduler, grad_scaler, device, epoch, ar
                     video_padding_mask=video_padding_mask.bool(), 
                     lang_padding_mask=text_padding_mask.bool(),
                     audio_embed=audio_seq,
-                    audio_padding_mask=audio_padding_mask.bool(),
+                    audio_padding_mask=audio_padding_mask,
                     )
             if args.model in ['cotrain']:
                 logits_ema = model.forward_from_ema(
@@ -63,7 +67,7 @@ def train(loader, model, optimizer, lr_scheduler, grad_scaler, device, epoch, ar
                     video_padding_mask=video_padding_mask.bool(), 
                     lang_padding_mask=text_padding_mask.bool(),
                     audio_embed=audio_seq,
-                    audio_padding_mask=audio_padding_mask.bool(),
+                    audio_padding_mask=audio_padding_mask,
                 )
                 logits = {**logits, **{f'ema-{k}':v for k,v in logits_ema.items()}}
 
@@ -129,6 +133,10 @@ def evaluate(loader, model, device, epoch, args):
     model.eval()
     batch_time = AverageMeter('Time', ':.2f')
     losses = AverageMeter('Loss', ':.4f')
+    if args.test:
+        iou_threshold_meters = {}
+        for theta in args.iou_thresholds:
+            iou_threshold_meters[f"{theta}"] = AverageMeter(f'IoU>={theta}', ':.4f')
     progress = ProgressMeter(
         len(loader), [batch_time, losses],
         prefix="Test: ")
@@ -138,8 +146,12 @@ def evaluate(loader, model, device, epoch, args):
     for idx, input_data in enumerate(loader):
         video_seq = input_data['video_features'].to(device, non_blocking=True)
         video_padding_mask = input_data['video_padding_mask'].to(device, non_blocking=True)
-        audio_seq = input_data['audio_features'].to(device, non_blocking=True)
-        audio_padding_mask = input_data['audio_padding_mask'].to(device, non_blocking=True)
+        if 'audio_features' in input_data.keys():
+            audio_seq = input_data['audio_features'].to(device, non_blocking=True)
+            audio_padding_mask = input_data['audio_padding_mask'].to(device, non_blocking=True).bool()
+        else:
+            audio_seq = None
+            audio_padding_mask = None
         text_embed = input_data['narration_features'].to(device, non_blocking=True)
         text_padding_mask = input_data['narration_padding_mask'].to(device, non_blocking=True)
 
@@ -148,7 +160,7 @@ def evaluate(loader, model, device, epoch, args):
                        video_padding_mask=video_padding_mask.bool(),
                        lang_padding_mask=text_padding_mask.bool(),
                        audio_embed=audio_seq,
-                       audio_padding_mask=audio_padding_mask.bool())
+                       audio_padding_mask=audio_padding_mask)
 
         loss_dict = get_loss(input_data=input_data,
                                  text_padding_mask=text_padding_mask,
@@ -157,6 +169,9 @@ def evaluate(loader, model, device, epoch, args):
 
         loss = loss_dict['loss']
         losses.update(loss.item(), video_seq.size(0))
+        if args.test:
+            for theta in args.iou_thresholds:
+                iou_threshold_meters[f"{theta}"].update(loss_dict[f'IoU>={theta}'], int(text_padding_mask.sum()))
 
         # Measure elapsed time
         batch_time.update(time.time() - end)
@@ -173,9 +188,13 @@ def evaluate(loader, model, device, epoch, args):
     print(f' * Loss {losses.avg:.4f}')
 
     for k, v in loss_dict.items():
-        args.val_plotter.add_data(f'val/{k}', v.item(), epoch)
+        if "IoU>=" not in k:
+            args.val_plotter.add_data(f'val/{k}', v.item(), epoch)
     
-    return loss_dict['mean IoU'].item()
+    if args.test:
+        return losses, iou_threshold_meters
+    else:
+        return loss_dict
 
 def setup(args):
     # DDP setting (not using DDP in our exp)
@@ -219,14 +238,16 @@ def get_dataset(args):
     train_dataset = D(
         split="train",
         duration=args.seq_len,
-        hop_length=args.seq_hop)
+        hop_length=args.seq_hop,
+        use_audio=args.use_audio)
     val_dataset = D(
         split="val",
         duration=args.seq_len,
-        hop_length=args.seq_hop)
+        hop_length=args.seq_hop,
+        use_audio=args.use_audio)
 
     train_sampler = data.RandomSampler(train_dataset)
-    val_sampler = data.SequentialSampler(val_dataset)
+    val_sampler = data.RandomSampler(val_dataset) #TODO: Does this need to be SequentialSampler? Or can it be random sampler?
 
     print("Loading train dataset...")
     train_loader = DataLoaderBG(train_dataset,
@@ -282,6 +303,10 @@ def main(args):
     if not args.test:
         _, _, train_loader, val_loader = get_dataset(args)
 
+    if args.test:
+        assert args.seq_len == args.seq_hop #no overlapping segments for full video inference
+        _, _, _, val_loader = get_dataset(args)
+
     ### Model ###
     if args.model in ['init']:
         model = ExoGroundingTransformer(num_encoder_layers=args.num_encoder_layers,
@@ -326,33 +351,26 @@ def main(args):
 
     ### test ###
     if args.test:
-        print('### test on downstream tasks ###')
-        if args.test.lower() == 'random':
-            print("[Warning] testing random weights")
-        else:
-            args.test = get_model_card(args.test)
-            checkpoint = torch.load(args.test, map_location='cpu')
-            state_dict = checkpoint['state_dict']
-            epoch = checkpoint['epoch']
-            try:
-                model_without_dp.load_state_dict(state_dict)
-            except:
-                model_without_dp.load_state_dict(state_dict, strict=False)
-                print('[WARNING] Non-Equal load for testing!')
+        args.test = get_model_card(args.test)
+        checkpoint = torch.load(args.test, map_location='cpu')
+        state_dict = checkpoint['state_dict']
+        epoch = checkpoint['epoch']
+        try:
+            model_without_dp.load_state_dict(state_dict)
+        except:
+            model_without_dp.load_state_dict(state_dict, strict=False)
+            print('[WARNING] Non-Equal load for testing!')
 
         model.eval()
 
-        if args.inference:
-            print('Start Inference ...')
-            #inference_egoexo4d(model, device, args) #TODO: Implement this!!!
-            sys.exit(0)
+        print('Start Inference ...')
+        _, iou_metric_meters = evaluate(val_loader, model, device, epoch, args)
+        mean_iou = []
+        for k, v in iou_metric_meters.items():
+            print(f"IoU>={k}: {v.avg:.4f}")
+            mean_iou.append(v.avg)
+        print(f"Mean IoU: {np.array(mean_iou).mean():.4f}")
 
-        """ if args.visualize:
-            print("Generating visualizations...")
-            #TODO: Generate the visualizations here!!
-            visualize_grounding(model, device, args) """
-        
-        val_loss = evaluate(val_loader, model, device, epoch, args)
         sys.exit(0)
 
     ### restart ###
@@ -429,7 +447,7 @@ def main(args):
         np.random.seed(epoch)
         random.seed(epoch)
         train_loss = train(train_loader, model, optimizer, lr_scheduler, grad_scaler, device, epoch, args)
-        _ = evaluate(val_loader, model, device, epoch, args)
+        _ = evaluate(val_loader, model, device, epoch, args) 
 
         if (epoch % args.eval_freq == 0) or (epoch == args.epochs - 1):
             is_best = train_loss < best_acc  # temporary use val loss
@@ -462,6 +480,17 @@ if __name__ == '__main__':
     main(args)
 
 """
+train:
 python main_egoexo4d.py --batch_size 16 --epochs 20 --num_workers 0
+
+test:
+python main_egoexo4d.py --batch_size 16 --test <PATH_TO_PTH_FILE>.tar --seq_hop 64 --num_workers 0
+
+flags:
+
+no audio features: --no_audio
+
+generate visualizations: --visualize
+
 python main.py --model cotrain --dataset htm-370k --batch_size 128 --use_text_pos_enc 0 --epochs 20 --pretrain {} --loss_threshold 0.5
 """

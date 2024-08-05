@@ -10,7 +10,7 @@ def parse_args():
     parser.add_argument('--language_model', default='word2vec', type=str)
     parser.add_argument('--dataset', default='egoexo4d', type=str)
     parser.add_argument('--seq_len', default=64, type=int)
-    parser.add_argument('--seq_hop', default=32, type=int)
+    parser.add_argument('--seq_hop', default=5, type=int)
     parser.add_argument('--batch_size', default=64, type=int)
     parser.add_argument('--loss', default='iou_l1', type=str)
     parser.add_argument('--lr', default=1e-4, type=float)
@@ -43,6 +43,7 @@ def parse_args():
     parser.add_argument('--temporal_agreement_type', default='keep', type=str)
     parser.add_argument('--use_alignability_head', default=0, type=int)
     parser.add_argument('--momentum_m', default=0.999, type=float)
+    parser.add_argument('--iou_thresholds', nargs='+', type=float, default=[0.1, 0.3, 0.5])
 
     # transformer
     parser.add_argument('--hidden_dim', default=256, type=int)
@@ -51,7 +52,8 @@ def parse_args():
 
     #exo grounding model
     parser.add_argument('--use_decoder', default=True, type=bool)
-    parser.add_argument('--use_audio', default=True, type=bool)
+    parser.add_argument('--use_audio', action='store_true', default=True)
+    parser.add_argument('--no_audio', dest='use_audio', action='store_false')
     parser.add_argument('--use_ego_align', default=False, type=bool)
 
     #data dimensions
@@ -61,12 +63,10 @@ def parse_args():
     parser.add_argument('--feature_dim', default=512, type=int)
     
     # inference
-    parser.add_argument('--inference', default=0, type=int)
     parser.add_argument('--worker_id', default=None, type=int)
     parser.add_argument('--visualize', action='store_true')
     parser.add_argument('--vis_freq', default=1, type=int)
-    parser.add_argument('--vis_dir', default="/private/home/arjunrs1/exo_narration_grounding/ExoGround/visualization", type=str)
-    parser.add_argument('--visualization_videos_per_epoch', default=2, type=int)
+    parser.add_argument('--visualization_videos_per_epoch', default=5, type=int)
     args = parser.parse_args()
     return args
 

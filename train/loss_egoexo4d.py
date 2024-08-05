@@ -86,6 +86,10 @@ def get_loss(input_data, logits, text_padding_mask, args):
     loss_dict['Timestamp L1 loss'] = (l1_loss_start + l1_loss_end) / 2
     loss_dict['IoU loss'] = iou_loss
     loss_dict['mean IoU'] = iou.mean()
+    if args.test:
+        for theta in args.iou_thresholds:
+            iou_count = (iou > theta).sum().item()  / (~text_padding_mask).sum().item() #NOTE: We do mean, not sum, bc AverageMeter muls by n
+            loss_dict[f'IoU>={theta}'] = iou_count
 
     # Combine losses into a single loss term if needed
     loss_dict['loss'] = loss_dict['Timestamp L1 loss'] + loss_dict['IoU loss']
@@ -105,12 +109,11 @@ def visualize(input_data, logits, args, epoch):
     pred_ends = grounding_preds[:, :, 1]
 
     base_video_path = "/datasets01/egoexo4d/v2/takes/"
-    #Do this, instead of using batch size bc drop_last=False for val
     video_count = 0
     for take_id, exo_cam, start_sec, pred_start, pred_end, narrs, pad_mask  in zip(take_ids, exo_cameras, start_secs, pred_starts, pred_ends, sentences, text_padding_mask):
         if video_count >= min(args.visualization_videos_per_epoch, len(take_ids)):
             break
-        video_path = os.path.join(base_video_path, take_id, "frame_aligned_videos", f"{exo_cam}.mp4")
+        video_path = os.path.join(base_video_path, take_id, "frame_aligned_videos", "downscaled", "448", f"{exo_cam}.mp4")
         cap = cv2.VideoCapture(video_path)
         
         # Get the frames per second (fps) of the video
@@ -118,7 +121,7 @@ def visualize(input_data, logits, args, epoch):
         
         # Calculate the frame number to start and end the clipping
         start_frame = int(start_sec * fps)
-        end_frame = int((start_sec + 10) * fps)
+        end_frame = int((start_sec + args.seq_len) * fps) #NOTE: We can make the vis videos any duration by changing args.seq_len to args.vis_video_len, just a thought
         
         # Set the starting frame
         cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
@@ -127,23 +130,39 @@ def visualize(input_data, logits, args, epoch):
         start_frames = pred_start * args.seq_len * fps + start_frame
         end_frames = pred_end * args.seq_len * fps + start_frame
 
+        #Create vis dir
+        vis_dir = os.path.join(args.log_path, "visualization")
+        if not os.path.isdir(vis_dir):
+            os.makedirs(vis_dir)
+
         # Prepare to write the output video
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        video_out_path = os.path.join(args.vis_dir, f'epoch={epoch}_{take_id}_{exo_cam}_start={start_sec}_duration={args.seq_len}.mp4')
+        video_out_path = os.path.join(vis_dir, f'epoch={epoch}_{take_id}_{exo_cam}_start={start_sec}_duration={args.seq_len}.mp4')
         out = cv2.VideoWriter(video_out_path, fourcc, fps, (int(cap.get(3)), int(cap.get(4))))
         
         # Read and process each frame
         current_frame = start_frame
+        current_sentence = None
         while current_frame < end_frame:
             ret, frame = cap.read()
             if not ret:
                 break
             
             # Check each sentence to see if it should be displayed on this frame
-            for sentence, s_frame, e_frame in zip(narrs, start_frames, end_frames):
-                if s_frame <= current_frame < e_frame:
-                    # Put the text on the frame
+            for sentence, s_frame, e_frame, mask in zip(narrs, pred_start * args.seq_len * fps + start_frame, pred_end * args.seq_len * fps + start_frame, pad_mask):
+                if s_frame <= current_frame < e_frame and not mask:
+                    if current_sentence is not None and s_frame < current_sentence[1]:
+                        # End the current sentence
+                        cv2.putText(frame, current_sentence[0], (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
+                        current_sentence = None
+                    
+                    # Start the new sentence
+                    if current_sentence is None:
+                        current_sentence = (sentence, e_frame)
+                    
+                    # Display the sentence
                     cv2.putText(frame, sentence, (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
+                    break
             
             # Write the frame to the output video
             out.write(frame)

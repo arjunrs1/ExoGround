@@ -48,7 +48,7 @@ def save_checkpoint(state, is_best=0, gap=1, filename='models/checkpoint.pth.tar
     if is_best:
         past_best = glob.glob(os.path.join(os.path.dirname(filename), 'model_best_*.pth.tar'))
         past_best = sorted(past_best, key=lambda x: int(''.join(filter(str.isdigit, x))))
-        if len(past_best) >= 5:
+        if len(past_best) >= 2:
             try: os.remove(past_best[0])
             except: pass
         # for i in past_best:
