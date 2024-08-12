@@ -12,6 +12,9 @@ import functools
 import torch.cuda.amp as amp 
 from config_egoexo4d import parse_args, set_path
 from loss_egoexo4d import get_loss, get_mask_from_time, get_text_pos, visualize
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 
 sys.path.append('../data/')
 from data.loader_egoexo4d import EgoExo4DDataLoader
@@ -28,9 +31,11 @@ def train(loader, model, optimizer, lr_scheduler, grad_scaler, device, epoch, ar
     batch_time = AverageMeter('Time',':.2f')
     data_time = AverageMeter('Data',':.2f')
     losses = AverageMeter('Loss',':.4f')
-    progress = ProgressMeter(
-        len(loader), [batch_time, data_time, losses],
-        prefix='Epoch:[{}]'.format(epoch))
+    rank = args.rank  # Assuming rank is passed in args
+    if rank == 0:
+        progress = ProgressMeter(
+            len(loader), [batch_time, data_time, losses],
+            prefix='Epoch:[{}]'.format(epoch))
     model.train()
 
     end = time.time()
@@ -97,13 +102,13 @@ def train(loader, model, optimizer, lr_scheduler, grad_scaler, device, epoch, ar
             optimizer.zero_grad()
 
             if args.model in ['cotrain']:
-                model._momentum_update()
+                model._momentum_update() #TODO: Need to DDPify this if using cotrain
 
         # log stats
-        if args.iteration % 5 == 0:
+        if rank == 0 and args.iteration % 5 == 0:
             for k, v in loss_dict.items():
-                args.train_plotter.add_data(f'train_local/{k}', v.item(), args.iteration)
-            args.train_plotter.add_data('train_local/lr', lr_scheduler.get_last_lr()[0], args.iteration)
+                args.train_plotter.add_data(f'train/{k}', v.item(), args.iteration)
+            args.train_plotter.add_data('train/lr', lr_scheduler.get_last_lr()[0], args.iteration)
             args.train_plotter.add_data('device/sps', 1/(time.time()-end), args.iteration)
             args.train_plotter.log_gpustat(step=args.iteration)
             args.train_plotter.writer.flush()
@@ -112,26 +117,29 @@ def train(loader, model, optimizer, lr_scheduler, grad_scaler, device, epoch, ar
             args.prof.step()
 
         batch_time.update(time.time() - end)
-        progress.display(idx)
+        if rank == 0:
+            progress.display(idx)
         lr_scheduler.step(args.iteration)
         end = time.time()
         args.iteration += 1
 
-        # save runtime ckpt (for long-schedule training)
-        if args.iteration % args.runtime_save_iter == 0:
-            print('saving runtime checkpoint ...')
-            state_dict = model.state_dict()
-            save_dict = {
-                'epoch': epoch,
-                'state_dict': state_dict,
-                'best_acc': 1e5,
-                'optimizer': optimizer.state_dict(),
-                'iteration': args.iteration}
-            save_runtime_checkpoint(save_dict, 
-                filename=os.path.join(args.model_path, 'runtime.pth.tar'))
+        if rank == 0:
+            # save runtime ckpt (for long-schedule training)
+            if args.iteration % args.runtime_save_iter == 0:
+                print('saving runtime checkpoint ...')
+                state_dict = model.state_dict()
+                save_dict = {
+                    'epoch': epoch,
+                    'state_dict': state_dict,
+                    'best_acc': 1e5,
+                    'optimizer': optimizer.state_dict(),
+                    'iteration': args.iteration}
+                save_runtime_checkpoint(save_dict, 
+                    filename=os.path.join(args.model_path, 'runtime.pth.tar'))
                 
-    print(f'epoch {epoch} finished, takes {time.time() - tic} seconds')
-    args.train_plotter.add_data('train_global/loss', losses.avg, epoch)
+    if rank == 0:
+        print(f'epoch {epoch} finished, takes {time.time() - tic} seconds')
+        args.train_plotter.add_data('train/total_epoch_loss', losses.avg, epoch)
     return losses.avg
 
 @torch.no_grad()
@@ -195,12 +203,13 @@ def evaluate(loader, model, device, epoch, args):
         if args.visualize and idx % args.vis_freq == 0 and not vis_this_epoch:
             visualize(input_data, logits, args, epoch)
             vis_this_epoch = True #only vis one batch per epoch
+            #TODO: Put this on tensorboard, so you can visualize during training
 
     print(f' * Loss {losses.avg:.4f}')
 
     for k, v in loss_dict.items():
         if "IoU>=" not in k:
-            args.val_plotter.add_data(f'val/{k}', v.item(), epoch)
+            args.train_plotter.add_data(f'val/{k}', v.item(), epoch)
     
     if args.test:
         return losses.avg, iou_threshold_meters
@@ -208,21 +217,22 @@ def evaluate(loader, model, device, epoch, args):
         return losses.avg
 
 def setup(args):
-    # DDP setting (not using DDP in our exp)
+    # Initialize distributed environment
     args.distributed = int(os.environ.get('SLURM_JOB_NUM_NODES', "1")) > 1
-
+    if args.distributed:
+        torch.distributed.init_process_group(backend='nccl')
+        args.rank = torch.distributed.get_rank()
+        args.world_size = torch.distributed.get_world_size()
+        torch.cuda.set_device(args.rank)
+        device = torch.device(f'cuda:{args.rank}')
+    else:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     # CUDA setting
     if torch.cuda.is_available():
-        if args.gpu is None:
-            args.gpu = str(os.environ["CUDA_VISIBLE_DEVICES"])
-        else:
-            os.environ["CUDA_VISIBLE_DEVICES"]=str(args.gpu)
-        device = torch.device('cuda')
-
-        num_gpu = len(str(args.gpu).split(','))
+        num_gpu = torch.cuda.device_count()
         args.num_gpu = num_gpu
-        args.batch_size = num_gpu * args.batch_size
-        print('=> Effective BatchSize = %d' % args.batch_size)
+        if args.rank == 0:
+            print('=> Effective BatchSize = %d' % args.batch_size) #TODO: Check whether this is right, or should be mult'd by num_gpu
     else:
         args.num_gpu = 0
         device = torch.device('cpu')
@@ -239,9 +249,6 @@ def setup(args):
     # tensorboard monitor in the background threads
     writer_train = SummaryWriter(logdir=os.path.join(args.log_path, 'train'), flush_secs=60)
     args.train_plotter = TB.PlotterThread(writer_train)
-    writer_val = SummaryWriter(logdir=os.path.join(args.log_path, 'val'), flush_secs=60)
-    args.val_plotter = TB.PlotterThread(writer_val)
-
     return device
 
 def get_dataset(args):
@@ -265,8 +272,8 @@ def get_dataset(args):
         use_distill_nce_loss=args.use_distill_nce_loss,
         use_center_duration=args.use_center_duration)
 
-    train_sampler = data.RandomSampler(train_dataset)
-    val_sampler = data.SequentialSampler(val_dataset) #TODO: Does this need to be SequentialSampler? Or can it be random sampler?
+    train_sampler = DistributedSampler(train_dataset, num_replicas=args.world_size, rank=args.rank)
+    val_sampler = DistributedSampler(val_dataset, num_replicas=args.world_size, rank=args.rank)
 
     print("Loading train dataset...")
     train_loader = DataLoaderBG(train_dataset,
@@ -284,7 +291,6 @@ def get_dataset(args):
     return train_dataset, val_dataset, train_loader, val_loader
 
 def get_test_dataset(args):
-    assert args.seq_len == args.seq_hop #No overlaps for whole video inference
     D = EgoExo4DDataLoader
     test_dataset = D(
         split="test",
@@ -296,7 +302,7 @@ def get_test_dataset(args):
         use_distill_nce_loss=args.use_distill_nce_loss,
         use_center_duration=args.use_center_duration)
 
-    test_sampler = data.SequentialSampler(test_dataset)
+    test_sampler = DistributedSampler(test_dataset, num_replicas=args.world_size, rank=args.rank)
 
     print("Loading test dataset...")
     test_loader = DataLoaderBG(test_dataset,
@@ -337,16 +343,20 @@ def optim_policy(model, args, policy='default'):
 
 
 def main(args):
+    device = setup(args)
+    rank = args.rank
     # pre-setup: overwritting
     if args.model == 'init':
         pass #TODO: This does nothing right now...eventually add functionality for cotraining/student-teacher training
 
-    device = setup(args)
     if not args.test:
         _, _, train_loader, val_loader = get_dataset(args)
 
     if args.test:
-        assert args.seq_hop == args.seq_len  #no overlapping segments for full video inference
+        #ensure no overlapping segments for full video inference
+        args.seq_hop = args.seq_len 
+        assert args.seq_hop == args.seq_len
+         
         test_loader = get_test_dataset(args)
 
     assert args.views in ["exo", "ego", "all"] # possible view settings for train/test
@@ -381,13 +391,14 @@ def main(args):
         )
 
     model.to(device)
+    model = DDP(model, device_ids=[rank], find_unused_parameters=True)  # Wrap model with DDP
     model_without_dp = model
 
     ### optimizer ###
     params = optim_policy(model, args, args.optim_policy)
     optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.wd)
 
-    if not args.test:
+    if not args.test and rank == 0:
         print('\n===========Check Grad============')
         for name, param in model.named_parameters():
             if param.requires_grad:
@@ -396,7 +407,9 @@ def main(args):
 
     ### test ###
     if args.test:
-        args.test = get_model_card(args.test)
+        if rank == 0:
+            args.test = get_model_card(args.test)
+            print(f"Loading model from {args.test} for testing...")
         checkpoint = torch.load(args.test, map_location='cpu')
         state_dict = checkpoint['state_dict']
         epoch = checkpoint['epoch']
@@ -404,18 +417,22 @@ def main(args):
             model_without_dp.load_state_dict(state_dict)
         except:
             model_without_dp.load_state_dict(state_dict, strict=False)
-            print('[WARNING] Non-Equal load for testing!')
+            if rank == 0:
+                print('[WARNING] Non-Equal load for testing!')
 
         model.eval()
 
-        print('Start Inference ...')
+        if rank == 0:
+            print('Start Inference ...')
         _, iou_metric_meters = evaluate(test_loader, model, device, epoch, args)
-        mean_iou = []
-        for k, v in iou_metric_meters.items():
-            print(f"IoU>={k}: {v.avg:.4f}")
-            mean_iou.append(v.avg)
-        print(f"Mean IoU: {np.array(mean_iou).mean():.4f}")
+        if rank == 0:
+            mean_iou = []
+            for k, v in iou_metric_meters.items():
+                print(f"IoU>={k}: {v.avg:.4f}")
+                mean_iou.append(v.avg)
+            print(f"Mean IoU: {np.array(mean_iou).mean():.4f}")
 
+        dist.barrier()
         sys.exit(0)
 
     ### restart ###
@@ -468,7 +485,8 @@ def main(args):
             model_without_dp._copy_param()
             print('[TwinExoGroundingTransformer] parameter copied from online stream to target stream')
 
-    args.decay_steps = args.epochs * len(train_loader)
+    if not args.test:
+        args.decay_steps = args.epochs * len(train_loader)
     args.warmup_iterations = 1000
     def lr_schedule_fn(iteration, iter_per_epoch, args):
         if iteration < args.warmup_iterations:
@@ -494,7 +512,7 @@ def main(args):
         train_loss = train(train_loader, model, optimizer, lr_scheduler, grad_scaler, device, epoch, args)
         val_loss = evaluate(val_loader, model, device, epoch, args) 
 
-        if (epoch % args.eval_freq == 0) or (epoch == args.epochs - 1):
+        if rank == 0 and ((epoch % args.eval_freq == 0) or (epoch == args.epochs - 1)):
             is_best = val_loss < best_acc  #use val loss to determine is_best
             best_acc = min(val_loss, best_acc)
             state_dict = model_without_dp.state_dict()
@@ -508,7 +526,9 @@ def main(args):
                 filename=os.path.join(args.model_path, 'epoch%d.pth.tar' % epoch), 
                 keep_all=(args.model in ['cotrain']),)
 
-    print('Training from ep %d to ep %d finished' % (args.start_epoch, args.epochs))
+    if rank == 0:
+        print('Training from ep %d to ep %d finished' % (args.start_epoch, args.epochs))
+    dist.destroy_process_group()
     sys.exit(0)
 
 
@@ -520,16 +540,18 @@ def get_model_card(tag):
     return model_card_dict.get(tag, tag)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     args = parse_args()
+    args.rank = int(os.environ['RANK'])
+    args.world_size = int(os.environ['WORLD_SIZE'])
     main(args)
 
 """
 train (no audio):
-python main_egoexo4d.py --batch_size 16 --epochs 100 --num_workers 0 --no_audio
+torchrun --num_proc_per_node=8 main_egoexo4d.py --batch_size 16 --epochs 100 --num_workers 0 --no_audio
 
 test:
-python main_egoexo4d.py --batch_size 16 --test <PATH_TO_PTH_FILE>.tar --seq_hop 64 --num_workers 0
+torchrun --num_proc_per_node=8 main_egoexo4d.py --batch_size 16 --test <PATH_TO_PTH_FILE>.tar --seq_hop 64 --num_workers 0
 
 flags:
 

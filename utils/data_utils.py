@@ -48,7 +48,7 @@ class BackgroundGenerator(threading.Thread):
 
 #decorator
 class background:
-    def __init__(self, max_prefetch=1):
+    def __init__(self, max_prefetch=-1):
         self.max_prefetch = max_prefetch
     def __call__(self, gen):
         def bg_generator(*args,**kwargs):

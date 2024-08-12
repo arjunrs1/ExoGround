@@ -55,48 +55,73 @@ def get_text_pos(start_list, end_list, device='cuda'):
 def get_loss(input_data, logits, text_padding_mask, args):
     if args.model in ['init', 'cotrain']:
         grounding_preds = logits['interval_preds']
-
     device = grounding_preds.device
-    
-    starts_pred = grounding_preds[:, :, 0]
-    ends_pred = grounding_preds[:, :, 1]
 
+    # Store losses in loss_dict
+    loss_dict = {}
     # Extract ground truth and predictions
-    starts_gt = input_data['starts'].to(device, non_blocking=True)
-    ends_gt = input_data['ends'].to(device, non_blocking=True)
+    if args.use_center_duration:
+        # Calculate starts and ends from centers and durations
+        centers_pred = grounding_preds[:, :, 0]
+        durations_pred = grounding_preds[:, :, 1]
+        centers_gt = input_data['mean'].to(device, non_blocking=True)
+        durations_gt = input_data['duration'].to(device, non_blocking=True)
+        # Apply the narration padding mask to filter out padded data
+        centers_gt_trunc = centers_gt[~text_padding_mask]
+        durations_gt_trunc = durations_gt[~text_padding_mask]
+        centers_pred_trunc = centers_pred[~text_padding_mask]
+        durations_pred_trunc = durations_pred[~text_padding_mask]
+        # Compute L1 loss for valid centers and durations
+        l1_loss_start = F.l1_loss(centers_pred_trunc, centers_gt_trunc, reduction='mean')
+        l1_loss_end = F.l1_loss(durations_pred_trunc, durations_gt_trunc, reduction='mean')
 
-    # Apply the narration padding mask to filter out padded data
-    starts_gt_trunc = starts_gt[~text_padding_mask]
-    ends_gt_trunc = ends_gt[~text_padding_mask]
-    starts_pred_trunc = starts_pred[~text_padding_mask]
-    ends_pred_trunc = ends_pred[~text_padding_mask]
-
-    # Compute L1 loss for valid start and end timestamps
-    l1_loss_start = F.l1_loss(starts_pred_trunc, starts_gt_trunc, reduction='mean')
-    l1_loss_end = F.l1_loss(ends_pred_trunc, ends_gt_trunc, reduction='mean')
+        starts_pred_trunc = centers_pred_trunc - durations_pred_trunc / 2
+        ends_pred_trunc = centers_pred_trunc + durations_pred_trunc / 2
+        starts_gt_trunc = centers_gt_trunc - durations_gt_trunc / 2
+        ends_gt_trunc = centers_gt_trunc + durations_gt_trunc / 2
+        loss_dict['Center L1 loss'] = l1_loss_start
+        loss_dict['Duration L1 loss'] = l1_loss_end
+    else:
+        starts_pred = grounding_preds[:, :, 0]
+        ends_pred = grounding_preds[:, :, 1]
+        starts_gt = input_data['starts'].to(device, non_blocking=True)
+        ends_gt = input_data['ends'].to(device, non_blocking=True)
+        # Apply the narration padding mask to filter out padded data
+        starts_gt_trunc = starts_gt[~text_padding_mask]
+        ends_gt_trunc = ends_gt[~text_padding_mask]
+        starts_pred_trunc = starts_pred[~text_padding_mask]
+        ends_pred_trunc = ends_pred[~text_padding_mask]
+        # Compute L1 loss for valid start and end timestamps
+        l1_loss_start = F.l1_loss(starts_pred_trunc, starts_gt_trunc, reduction='mean')
+        l1_loss_end = F.l1_loss(ends_pred_trunc, ends_gt_trunc, reduction='mean')
+        loss_dict['Timestamp L1 loss'] = (l1_loss_start + l1_loss_end) / 2
 
     # Compute IoU loss for valid intervals
     intersection = torch.clamp(torch.min(ends_pred_trunc, ends_gt_trunc) - torch.max(starts_pred_trunc, starts_gt_trunc), min=0)
     union = torch.max(ends_pred_trunc, ends_gt_trunc) - torch.min(starts_pred_trunc, starts_gt_trunc)
     iou = intersection / (union + args.iou_loss_eps) #TODO: Why is union zero???
     iou_loss = 1.0 - iou.mean()  # IoU loss is 1 - IoU
-
-    # Store losses in loss_dict
-    loss_dict = {}
-    loss_dict['Timestamp L1 loss'] = (l1_loss_start + l1_loss_end) / 2
     loss_dict['IoU loss'] = iou_loss
     loss_dict['mean IoU'] = iou.mean()
+    if args.use_distill_nce_loss and 'distill_infonce_loss' in logits.keys():
+        loss_dict['InfoNCE loss'] = logits['distill_infonce_loss']
     if args.test:
         for theta in args.iou_thresholds:
             iou_count = (iou > theta).sum().item()  / (~text_padding_mask).sum().item() #NOTE: We do mean, not sum, bc AverageMeter muls by n
             loss_dict[f'IoU>={theta}'] = iou_count
-
-    # Combine losses into a single loss term if needed
-    loss_dict['loss'] = loss_dict['Timestamp L1 loss'] + loss_dict['IoU loss']
-
+    # Combine losses into a single loss term:
+    loss_dict['loss'] = loss_dict['IoU loss']
+    if args.use_center_duration:
+        loss_dict['loss'] += loss_dict['Duration L1 loss']
+        loss_dict['loss'] += loss_dict['Center L1 loss']
+    else:
+        loss_dict['loss'] += loss_dict['Timestamp L1 loss']
+    if args.use_distill_nce_loss and 'InfoNCE loss' in loss_dict.keys():
+        loss_dict['loss'] += loss_dict['InfoNCE loss']
     return loss_dict
 
-def visualize(input_data, logits, args, epoch):
+#TODO: Improve this function to either 1) Generate the GT video in parallel or ...(?) 
+def visualize(input_data, logits, args, epoch): 
     # Open the video file
     sentences = input_data['metadata']['narrations']
     take_ids = input_data['metadata']['video_id']

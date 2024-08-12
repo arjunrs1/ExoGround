@@ -23,6 +23,7 @@ class ExoGroundingTransformer(nn.Module):
                  text_embed_dim=4096,
                  audio_embed_dim=2304,
                  feature_dim=512,
+                 use_distill_nce_loss=False,
                  ):
         super().__init__()
 
@@ -40,6 +41,7 @@ class ExoGroundingTransformer(nn.Module):
         self.audio_embed_dim = audio_embed_dim
         self.video_embed_dim = video_embed_dim
         self.feature_dim = feature_dim
+        self.use_distill_nce_loss = use_distill_nce_loss
 
         #initalize multi-modal encoder and narration decoder
         self.tfm_modules = []
@@ -59,6 +61,10 @@ class ExoGroundingTransformer(nn.Module):
         self.ln_video_init = LayerNorm(self.feature_dim)
         self.ln_position_init = LayerNorm(self.feature_dim)
         self.ln_joint_post_enc = LayerNorm(self.feature_dim)
+
+        #initialize exo projection layer for infoNCE loss
+        if self.use_distill_nce_loss:
+            self.exo_feature_proj = nn.Linear(self.feature_dim, self.video_embed_dim)
 
         #initialize audio embeddings and projection layers
         if self.use_audio:
@@ -104,6 +110,7 @@ class ExoGroundingTransformer(nn.Module):
     def forward(self, video_embed, lang_embed,
                 video_padding_mask, lang_padding_mask,
                 audio_embed=None, audio_padding_mask=None,
+                egocentric_video_embed=None,
                 interpolate_from=None):
         # text embedding without temporal-enc
         lang_embed_raw = self.get_textual_feature(lang_embed)
@@ -132,6 +139,11 @@ class ExoGroundingTransformer(nn.Module):
         text_features = all_output[:, :, 2*T::] if self.use_audio else all_output[:, :, T::]
         decoder_context = all_output[:, :, :2*T] if self.use_audio else all_output[:, :, :T]
 
+        if self.use_distill_nce_loss and egocentric_video_embed is not None:
+            exo_features = all_output[:, :, :T].mean(dim=1)  # Slice out exocentric video features
+            exo_features_projected = self.exo_feature_proj(exo_features)
+            distill_loss = self.compute_info_nce_loss(exo_features_projected, egocentric_video_embed)
+
         if self.use_decoder:
             decoder_output = self.decoder(x=text_features[:,-1,::].permute(1, 0, 2), memory=decoder_context[:,-1,::].permute(1, 0, 2), tgt_key_padding_mask=lang_padding_mask)
             decoder_text_features = decoder_output[-1].permute(1,0,2)
@@ -142,7 +154,39 @@ class ExoGroundingTransformer(nn.Module):
             grounding = self.grounding_head(text_features)
 
         output_dict = {'interval_preds': grounding}
+        if self.use_distill_nce_loss:
+            output_dict['distill_infonce_loss'] = distill_loss
+
         return output_dict
+    
+    def compute_info_nce_loss(self, features, positive_features, temperature=0.1):
+        """
+        Compute the InfoNCE loss between features and positive features, considering both positive and negative samples.
+        
+        Args:
+        - features (torch.Tensor): Tensor of shape (batch_size, num_features, feature_dim)
+        - positive_features (torch.Tensor): Tensor of shape (batch_size, num_features, feature_dim)
+        - temperature (float): A temperature scaling factor (default 0.1)
+        
+        Returns:
+        - torch.Tensor: Scalar tensor containing the InfoNCE loss.
+        """
+        batch_size, num_features, feature_dim = features.size()
+        # Normalize features to get unit vectors
+        features_norm = F.normalize(features, p=2, dim=2)
+        positive_features_norm = F.normalize(positive_features, p=2, dim=2)
+        # Compute similarities
+        # Transpose positive features to align with features for matrix multiplication
+        similarities = torch.bmm(features_norm, positive_features_norm.transpose(1, 2)) / temperature
+        # Create labels for the positive samples (diagonal elements in the batch)
+        labels = torch.arange(num_features).to(features.device)
+        # Use log-softmax for numerical stability
+        log_prob = F.log_softmax(similarities, dim=2)
+        # Gather the log probabilities of positive samples
+        log_prob_positive = log_prob.gather(2, labels.view(1, -1).expand(batch_size, -1).unsqueeze(2)).squeeze(2)
+        # Compute the mean of the log probabilities of the positive samples
+        nce_loss = -log_prob_positive.mean()
+        return nce_loss
 
     def get_joint_feature(self, video_embed, video_padding_mask,
                           lang_embed_with_time, lang_padding_mask,

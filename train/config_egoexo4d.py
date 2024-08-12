@@ -43,7 +43,7 @@ def parse_args():
     parser.add_argument('--temporal_agreement_type', default='keep', type=str)
     parser.add_argument('--use_alignability_head', default=0, type=int)
     parser.add_argument('--momentum_m', default=0.999, type=float)
-    parser.add_argument('--iou_thresholds', nargs='+', type=float, default=[0.1, 0.3, 0.5])
+    parser.add_argument('--iou_thresholds', nargs='+', type=float, default=[0.1, 0.3, 0.5, 0.7])
 
     # transformer
     parser.add_argument('--hidden_dim', default=256, type=int)
@@ -54,7 +54,10 @@ def parse_args():
     parser.add_argument('--use_decoder', default=True, type=bool)
     parser.add_argument('--use_audio', action='store_true', default=True)
     parser.add_argument('--no_audio', dest='use_audio', action='store_false')
-    parser.add_argument('--use_ego_align', default=False, type=bool)
+    parser.add_argument('--use_keysteps', action='store_true', default=True)
+    parser.add_argument('--use_distill_nce_loss', action='store_true', default=False)
+    parser.add_argument('--use_center_duration', action='store_true', default=True)
+    parser.add_argument('--views', default='exo', type=str)
 
     #data dimensions
     parser.add_argument('--video_feature_dim', default=4096, type=int)
@@ -88,8 +91,8 @@ def set_path(args):
         exp_path = (f"log{args.prefix}/{name_prefix}{dt_string}_"
             f"{args.model}_{args.loss}_{args.dataset}_len{args.seq_len}_"
             f"e{args.num_encoder_layers}d{args.num_decoder_layers}_pos-{args.pos_enc}_textpos-{args.use_text_pos_enc}_policy-{args.optim_policy}_"
-            f"bs{args.batch_size}_lr{args.lr}_audio={args.use_audio}_decoder={args.use_decoder}_"
-            f"ego={args.use_ego_align}")
+            f"bs{args.batch_size}_lr{args.lr}_audio={args.use_audio}_decoder={args.use_decoder}_keysteps={args.use_keysteps}_view={args.views}_meandur={args.use_center_duration}_distill={args.use_distill_nce_loss}"
+            )
 
     log_path = os.path.join(exp_path, 'log')
     model_path = os.path.join(exp_path, 'model')
