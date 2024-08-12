@@ -120,9 +120,7 @@ def get_loss(input_data, logits, text_padding_mask, args):
         loss_dict['loss'] += loss_dict['InfoNCE loss']
     return loss_dict
 
-#TODO: Improve this function to either 1) Generate the GT video in parallel or ...(?) 
-def visualize(input_data, logits, args, epoch): 
-    # Open the video file
+def visualize(input_data, logits, args, epoch):
     sentences = input_data['metadata']['narrations']
     take_ids = input_data['metadata']['video_id']
     exo_cameras = input_data['metadata']['exo_camera']
@@ -130,72 +128,98 @@ def visualize(input_data, logits, args, epoch):
     
     text_padding_mask = input_data['narration_padding_mask'].cpu().numpy()
     grounding_preds = logits['interval_preds'].cpu().numpy()
-    pred_starts = grounding_preds[:, :, 0]
-    pred_ends = grounding_preds[:, :, 1]
+    
+    if args.use_center_duration:
+        centers_gt = input_data['mean'].cpu().numpy()
+        durations_gt = input_data['duration'].cpu().numpy()
+        gt_starts = centers_gt - durations_gt / 2
+        gt_ends = centers_gt + durations_gt / 2
+
+        centers_pred = grounding_preds[:, :, 0]
+        durations_pred = grounding_preds[:, :, 1]
+        pred_starts = centers_pred - durations_pred / 2
+        pred_ends = centers_pred + durations_pred / 2
+    else:
+        gt_starts = input_data['starts'].cpu().numpy()
+        gt_ends = input_data['ends'].cpu().numpy()
+        pred_starts = grounding_preds[:, :, 0]
+        pred_ends = grounding_preds[:, :, 1]
 
     base_video_path = "/datasets01/egoexo4d/v2/takes/"
     video_count = 0
-    for take_id, exo_cam, start_sec, pred_start, pred_end, narrs, pad_mask  in zip(take_ids, exo_cameras, start_secs, pred_starts, pred_ends, sentences, text_padding_mask):
+    for take_id, exo_cam, start_sec, pred_start, pred_end, gt_start, gt_end, narrs, pad_mask in zip(take_ids, exo_cameras, start_secs, pred_starts, pred_ends, gt_starts, gt_ends, sentences, text_padding_mask):
         if video_count >= min(args.visualization_videos_per_epoch, len(take_ids)):
             break
         video_path = os.path.join(base_video_path, take_id, "frame_aligned_videos", "downscaled", "448", f"{exo_cam}.mp4")
-        cap = cv2.VideoCapture(video_path)
+        cap_pred = cv2.VideoCapture(video_path)
+        cap_gt = cv2.VideoCapture(video_path)
         
-        # Get the frames per second (fps) of the video
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        
-        # Calculate the frame number to start and end the clipping
+        fps = cap_pred.get(cv2.CAP_PROP_FPS)
         start_frame = int(start_sec * fps)
-        end_frame = int((start_sec + args.seq_len) * fps) #NOTE: We can make the vis videos any duration by changing args.seq_len to args.vis_video_len, just a thought
+        end_frame = int((start_sec + args.seq_len) * fps)
         
-        # Set the starting frame
-        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        cap_pred.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        cap_gt.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
         
-        # Calculate the absolute start and end frames for each sentence
-        start_frames = pred_start * args.seq_len * fps + start_frame
-        end_frames = pred_end * args.seq_len * fps + start_frame
-
-        #Create vis dir
         vis_dir = os.path.join(args.log_path, "visualization")
         if not os.path.isdir(vis_dir):
             os.makedirs(vis_dir)
 
-        # Prepare to write the output video
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         video_out_path = os.path.join(vis_dir, f'epoch={epoch}_{take_id}_{exo_cam}_start={start_sec}_duration={args.seq_len}.mp4')
-        out = cv2.VideoWriter(video_out_path, fourcc, fps, (int(cap.get(3)), int(cap.get(4))))
+        out = cv2.VideoWriter(video_out_path, fourcc, fps, (int(cap_pred.get(3)) * 2, int(cap_pred.get(4))))
         
-        # Read and process each frame
         current_frame = start_frame
-        current_sentence = None
         while current_frame < end_frame:
-            ret, frame = cap.read()
-            if not ret:
+            ret_pred, frame_pred = cap_pred.read()
+            ret_gt, frame_gt = cap_gt.read()
+            if not ret_pred or not ret_gt:
                 break
             
-            # Check each sentence to see if it should be displayed on this frame
-            for sentence, s_frame, e_frame, mask in zip(narrs, pred_start * args.seq_len * fps + start_frame, pred_end * args.seq_len * fps + start_frame, pad_mask):
-                if s_frame <= current_frame < e_frame and not mask:
-                    if current_sentence is not None and s_frame < current_sentence[1]:
-                        # End the current sentence
-                        cv2.putText(frame, current_sentence[0], (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
-                        current_sentence = None
-                    
-                    # Start the new sentence
-                    if current_sentence is None:
-                        current_sentence = (sentence, e_frame)
-                    
-                    # Display the sentence
-                    cv2.putText(frame, sentence, (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
-                    break
+            # Annotate predicted and ground truth frames
+            frame_pred = annotate_frame(frame_pred, narrs, pred_start, pred_end, pad_mask, current_frame, start_frame, fps, args.seq_len, "P")
+            frame_gt = annotate_frame(frame_gt, narrs, gt_start, gt_end, pad_mask, current_frame, start_frame, fps, args.seq_len, "GT")
             
-            # Write the frame to the output video
-            out.write(frame)
+            # Stitch frames side by side
+            combined_frame = np.hstack((frame_pred, frame_gt))
+            
+            out.write(combined_frame)
             current_frame += 1
         
-        # Release everything when done
-        cap.release()
+        cap_pred.release()
+        cap_gt.release()
         out.release()
         cv2.destroyAllWindows()
         video_count += 1
-        print(f"Generating epoch {epoch} video: {video_out_path}...")
+        print(f"Generating epoch {epoch} dual video: {video_out_path}...")
+
+def annotate_frame(frame, narrs, starts, ends, pad_mask, current_frame, start_frame, fps, seq_len, label):
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.5
+    color = (255, 255, 255)  # White color for text
+    
+    # Loop through each narration and its corresponding start and end times
+    for i in range(len(starts)):
+        if pad_mask[i] == 1:
+            continue
+        
+        # Convert relative start and end times to frame numbers
+        start_frame_num = int(starts[i] * seq_len * fps) + start_frame
+        end_frame_num = int(ends[i] * seq_len * fps) + start_frame
+        
+        # Check if the current frame is within the interval
+        if start_frame_num <= current_frame < end_frame_num:
+            narr = narrs[i]
+            
+            # Calculate the position of the text on the frame
+            x = 10
+            y = 20 + (i * 20)
+            
+            # Draw a background rectangle for better text visibility
+            text_size = cv2.getTextSize(f"{label}: {narr}", font, font_scale, 1)[0]
+            cv2.rectangle(frame, (x, y - text_size[1] - 2), (x + text_size[0], y + 2), color, -1)
+            
+            # Draw the text on the frame
+            cv2.putText(frame, f"{label}: {narr}", (x, y), font, font_scale, (0, 0, 0), 1)  # Black text
+
+    return frame

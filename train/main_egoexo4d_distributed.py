@@ -144,6 +144,7 @@ def train(loader, model, optimizer, lr_scheduler, grad_scaler, device, epoch, ar
 
 @torch.no_grad()
 def evaluate(loader, model, device, epoch, args):
+    rank = args.rank
     model.eval()
     batch_time = AverageMeter('Time', ':.2f')
     losses = AverageMeter('Loss', ':.4f')
@@ -196,20 +197,20 @@ def evaluate(loader, model, device, epoch, args):
         batch_time.update(time.time() - end)
         end = time.time()
 
-        if idx % args.print_freq == 0:
+        if (rank == 0) and (idx % args.print_freq == 0):
             progress.display(idx)
 
         # Visualization call
-        if args.visualize and idx % args.vis_freq == 0 and not vis_this_epoch:
+        if rank == 0 and (args.visualize and idx % args.vis_freq == 0 and not vis_this_epoch):
             visualize(input_data, logits, args, epoch)
-            vis_this_epoch = True #only vis one batch per epoch
+            vis_this_epoch = True
             #TODO: Put this on tensorboard, so you can visualize during training
 
-    print(f' * Loss {losses.avg:.4f}')
-
-    for k, v in loss_dict.items():
-        if "IoU>=" not in k:
-            args.train_plotter.add_data(f'val/{k}', v.item(), epoch)
+    if rank == 0:
+        print(f' * Loss {losses.avg:.4f}')
+        for k, v in loss_dict.items():
+            if "IoU>=" not in k:
+                args.train_plotter.add_data(f'val/{k}', v.item(), epoch)
     
     if args.test:
         return losses.avg, iou_threshold_meters
@@ -307,7 +308,7 @@ def get_test_dataset(args):
     print("Loading test dataset...")
     test_loader = DataLoaderBG(test_dataset,
         batch_size=args.batch_size, num_workers=args.num_workers,
-        collate_fn=test_dataset.collate_fn, pin_memory=True, drop_last=True,
+        collate_fn=test_dataset.collate_fn, pin_memory=True, drop_last=False,
         shuffle=False, sampler=test_sampler, 
     )
     return test_loader
@@ -547,11 +548,11 @@ if __name__ == "__main__":
     main(args)
 
 """
-train (no audio):
-torchrun --num_proc_per_node=8 main_egoexo4d.py --batch_size 16 --epochs 100 --num_workers 0 --no_audio
+train keysteps (no audio):
+torchrun --nproc_per_node=8 main_egoexo4d_distributed.py --batch_size 16 --epochs 100 --num_workers 0 --no_audio --use_keysteps
 
-test:
-torchrun --num_proc_per_node=8 main_egoexo4d.py --batch_size 16 --test <PATH_TO_PTH_FILE>.tar --seq_hop 64 --num_workers 0
+test keysteps (no audio):
+# torchrun --nproc_per_node=8 main_egoexo4d_distributed.py --batch_size 16 --test <PATH_TO_PTH_FILE>.tar --num_workers 0 --use_keysteps
 
 flags:
 
@@ -570,9 +571,4 @@ train on exo views only: --views exo
 train on all views: --views all
 
 resume training: --resume <PATH_TO_FILE>.tar
-
-
-cotraining:
-
-python main.py --model cotrain --dataset htm-370k --batch_size 128 --use_text_pos_enc 0 --epochs 20 --pretrain {} --loss_threshold 0.5
 """
