@@ -155,7 +155,6 @@ class EgoExo4DDataLoader(Dataset):
         starts = starts[:self.duration]
         ends = ends[:self.duration]
 
-        #TODO: Change 4096 from hardcoded
         padded_narration_features = torch.zeros(int(self.duration), 1, 4096) 
         padded_starts = torch.zeros(int(self.duration),1)
         padded_ends = torch.zeros(int(self.duration),1)
