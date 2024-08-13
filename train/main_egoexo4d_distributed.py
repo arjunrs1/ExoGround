@@ -25,7 +25,7 @@ import utils.tensorboard_utils as TB
 from utils.data_utils import DataLoaderBG
 from utils.train_utils import clip_gradients
 from utils.utils import AverageMeter, save_checkpoint, neq_load_customized, \
-calc_topk_accuracy, ProgressMeter, neq_load_customized, save_runtime_checkpoint
+calc_topk_accuracy, ProgressMeter, neq_load_customized, save_runtime_checkpoint, MovingAverage
 
 def train(loader, model, optimizer, lr_scheduler, grad_scaler, device, epoch, args):
     batch_time = AverageMeter('Time',':.2f')
@@ -507,14 +507,22 @@ def main(args):
     args.prof = None
     
     print('Main loop starts')
+    #moving_average = MovingAverage(size=5)  # Adjust size to your needs
+    #best_val_loss = float('inf')
+    #patience = 10
+    #epochs_no_improve = 0
     for epoch in range(args.start_epoch, args.epochs):
         np.random.seed(epoch)
         random.seed(epoch)
         train_loss = train(train_loader, model, optimizer, lr_scheduler, grad_scaler, device, epoch, args)
         val_loss = evaluate(val_loader, model, device, epoch, args) 
 
+        #moving_average.update(val_loss)
+        #smoothed_val_loss = moving_average.average()
         if rank == 0 and ((epoch % args.eval_freq == 0) or (epoch == args.epochs - 1)):
             is_best = val_loss < best_acc  #use val loss to determine is_best
+            #is_best = smoothed_val_loss < best_val_loss (REPLACE ABOVE LINE WITH THIS IF USING MOVING AVERAGE)
+            #if is_best:
             best_acc = min(val_loss, best_acc)
             state_dict = model_without_dp.state_dict()
             save_dict = {
@@ -526,7 +534,11 @@ def main(args):
             save_checkpoint(save_dict, is_best, args.eval_freq, 
                 filename=os.path.join(args.model_path, 'epoch%d.pth.tar' % epoch), 
                 keep_all=(args.model in ['cotrain']),)
-
+            #else:
+                #epochs_no_improve += 1
+                #if epochs_no_improve >= patience:
+                #    print(f"No improvement for {patience} consecutive evaluations.")
+                #    break  # Optionally stop training early
     if rank == 0:
         print('Training from ep %d to ep %d finished' % (args.start_epoch, args.epochs))
     dist.destroy_process_group()

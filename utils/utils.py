@@ -327,7 +327,22 @@ def second_to_time(second):
         m_ = int(s//60) 
         s_ = int(s - m_*60)
         out.append("{}:{}".format(str(m_).zfill(2), str(s_).zfill(2)))
-    return out 
+    return out
+
+class MovingAverage:
+    def __init__(self, size):
+        self.size = size
+        self.queue = []
+        self.sum = 0
+
+    def update(self, val):
+        if len(self.queue) == self.size:
+            self.sum -= self.queue.pop(0)
+        self.queue.append(val)
+        self.sum += val
+
+    def average(self):
+        return self.sum / len(self.queue)
 
 
 
