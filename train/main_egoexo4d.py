@@ -526,14 +526,14 @@ if __name__ == '__main__':
 
 """
 train (no audio):
-python main_egoexo4d.py --batch_size 16 --epochs 100 --num_workers 0 --no_audio
+python main_egoexo4d.py --batch_size 16 --epochs 100 --num_workers 0
 
 test:
 python main_egoexo4d.py --batch_size 16 --test <PATH_TO_PTH_FILE>.tar --seq_hop 64 --num_workers 0
 
 flags:
 
-no audio features: --no_audio
+use audio features: --use_audio
 
 generate visualizations: --visualize
 

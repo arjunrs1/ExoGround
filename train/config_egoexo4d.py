@@ -52,9 +52,8 @@ def parse_args():
 
     #exo grounding model
     parser.add_argument('--use_decoder', default=True, type=bool)
-    parser.add_argument('--use_audio', action='store_true', default=True)
-    parser.add_argument('--no_audio', dest='use_audio', action='store_false')
-    parser.add_argument('--use_keysteps', action='store_true', default=True)
+    parser.add_argument('--use_audio', action='store_true', default=False)
+    parser.add_argument('--use_keysteps', action='store_true', default=False)
     parser.add_argument('--use_distill_nce_loss', action='store_true', default=False)
     parser.add_argument('--use_center_duration', action='store_true', default=True)
     parser.add_argument('--views', default='exo', type=str)

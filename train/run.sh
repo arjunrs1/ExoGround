@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=ExoGround_ks_exo_distill_train_num_workers=4
-#SBATCH --output=/checkpoint/%u/slurm_logs/exoground/%j.out
-#SBATCH --error=/checkpoint/%u/slurm_logs/exoground/%j.out
+#SBATCH --job-name=ExoGround_ks_exo_distill_train
+#SBATCH --output=/checkpoint/%u/slurm_logs/exoground/train_%j.out
+#SBATCH --error=/checkpoint/%u/slurm_logs/exoground/train_%j.out
 #SBATCH --partition=learnfair
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
@@ -14,4 +14,4 @@
 ### init virtual environment if needed
 source activate sounding_narrations
 
-srun --label torchrun --nproc_per_node=8 main_egoexo4d_distributed.py --batch_size 16 --epochs 100 --num_workers 4 --no_audio --use_keysteps --views exo --use_distill_nce_loss
+srun --label torchrun --nproc_per_node=8 main_egoexo4d_distributed.py --batch_size 16 --epochs 100 --num_workers 4 --use_keysteps --views exo --use_distill_nce_loss

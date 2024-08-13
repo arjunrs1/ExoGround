@@ -299,7 +299,7 @@ def get_test_dataset(args):
         hop_length=args.seq_hop,
         use_audio=args.use_audio,
         use_keysteps=args.use_keysteps,
-        views=args.views,
+        views="exo", #fix testing on all exo views
         use_distill_nce_loss=args.use_distill_nce_loss,
         use_center_duration=args.use_center_duration)
 
@@ -561,14 +561,14 @@ if __name__ == "__main__":
 
 """
 train keysteps (no audio):
-torchrun --nproc_per_node=8 main_egoexo4d_distributed.py --batch_size 16 --epochs 100 --num_workers 0 --no_audio --use_keysteps
+torchrun --nproc_per_node=8 main_egoexo4d_distributed.py --batch_size 16 --epochs 100 --num_workers 0 --use_keysteps
 
 test keysteps (no audio):
 # torchrun --nproc_per_node=8 main_egoexo4d_distributed.py --batch_size 16 --test <PATH_TO_PTH_FILE>.tar --num_workers 0 --use_keysteps
 
 flags:
 
-no audio features: --no_audio
+use audio features: --use_audio
 
 generate visualizations: --visualize
 

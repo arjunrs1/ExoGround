@@ -11,11 +11,11 @@ class EgoExo4DDataLoader(Dataset):
                 split='train',
                 duration=20,
                 hop_length=10,
-                use_audio=True,
+                use_audio=False,
                 use_keysteps=False,
                 views="exo",
                 use_distill_nce_loss=False,
-                use_center_duration=False,
+                use_center_duration=True,
                 fps=30):
         self.split = split
         self.duration = duration

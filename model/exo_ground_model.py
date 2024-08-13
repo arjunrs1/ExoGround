@@ -18,7 +18,7 @@ class ExoGroundingTransformer(nn.Module):
                  pos_enc='learned',
                  use_text_pos_enc=0,
                  random_pos_start=1,
-                 use_audio=True,
+                 use_audio=False,
                  video_embed_dim=4096,
                  text_embed_dim=4096,
                  audio_embed_dim=2304,
