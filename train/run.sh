@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=ExoGround_ks_exo_distill_train
+#SBATCH --job-name=ExoGround_ks_multi_train_400
 #SBATCH --output=/checkpoint/%u/slurm_logs/exoground/train_%j.out
 #SBATCH --error=/checkpoint/%u/slurm_logs/exoground/train_%j.out
 #SBATCH --partition=learnfair
@@ -14,4 +14,10 @@
 ### init virtual environment if needed
 source activate sounding_narrations
 
-srun --label torchrun --nproc_per_node=8 main_egoexo4d_distributed.py --batch_size 16 --epochs 100 --num_workers 4 --use_keysteps --views exo --use_distill_nce_loss
+srun --label torchrun --nproc_per_node=8 \
+    main_egoexo4d_distributed.py \
+    --batch_size 16 \
+    --epochs 100 \
+    --num_workers 0 \
+    --use_keysteps \
+    --views multi

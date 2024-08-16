@@ -6,6 +6,7 @@ from tensorboardX import SummaryWriter
 import numpy as np 
 import random 
 from tqdm import tqdm
+import json
 import time
 import math
 import functools
@@ -26,6 +27,13 @@ from utils.data_utils import DataLoaderBG
 from utils.train_utils import clip_gradients
 from utils.utils import AverageMeter, save_checkpoint, neq_load_customized, \
 calc_topk_accuracy, ProgressMeter, neq_load_customized, save_runtime_checkpoint, MovingAverage
+
+def get_phase(epoch, total_epochs, num_phases=6):
+    # Divide the total epochs by the number of phases to determine the length of each phase
+    #TODO: Fix - phase is not updating during training currently
+    phase_length = total_epochs // num_phases
+    current_phase = epoch // phase_length
+    return current_phase
 
 def train(loader, model, optimizer, lr_scheduler, grad_scaler, device, epoch, args):
     batch_time = AverageMeter('Time',':.2f')
@@ -59,6 +67,10 @@ def train(loader, model, optimizer, lr_scheduler, grad_scaler, device, epoch, ar
             ego_seq = input_data['ego_video_features'].to(device, non_blocking=True)
         else:
             ego_seq = None
+        if args.views == "multi" and 'view_available_mask' in input_data.keys():
+            view_mask = input_data['view_available_mask'].to(device, non_blocking=True)
+        else:
+            view_mask = None
 
         B, T, _ = video_seq.shape
 
@@ -69,7 +81,8 @@ def train(loader, model, optimizer, lr_scheduler, grad_scaler, device, epoch, ar
                     lang_padding_mask=text_padding_mask.bool(),
                     audio_embed=audio_seq,
                     audio_padding_mask=audio_padding_mask,
-                    egocentric_video_embed=ego_seq
+                    egocentric_video_embed=ego_seq,
+                    view_mask=view_mask
                     )
             if args.model in ['cotrain']:
                 logits_ema = model.forward_from_ema(
@@ -158,6 +171,8 @@ def evaluate(loader, model, device, epoch, args):
 
     end = time.time()
     vis_this_epoch = False
+    if args.test:
+        save_list = []
     for idx, input_data in enumerate(loader):
         video_seq = input_data['video_features'].to(device, non_blocking=True)
         video_padding_mask = input_data['video_padding_mask'].to(device, non_blocking=True)
@@ -173,6 +188,10 @@ def evaluate(loader, model, device, epoch, args):
             ego_seq = input_data['ego_video_features'].to(device, non_blocking=True)
         else:
             ego_seq = None
+        if args.views == "multi" and 'view_available_mask' in input_data.keys():
+            view_mask = input_data['view_available_mask'].to(device, non_blocking=True)
+        else:
+            view_mask = None
 
         # Forward pass
         logits = model(video_seq, text_embed,
@@ -180,7 +199,8 @@ def evaluate(loader, model, device, epoch, args):
                        lang_padding_mask=text_padding_mask.bool(),
                        audio_embed=audio_seq,
                        audio_padding_mask=audio_padding_mask,
-                       egocentric_video_embed=ego_seq)
+                       egocentric_video_embed=ego_seq,
+                       view_mask=view_mask)
 
         loss_dict = get_loss(input_data=input_data,
                                  text_padding_mask=text_padding_mask,
@@ -197,6 +217,13 @@ def evaluate(loader, model, device, epoch, args):
         batch_time.update(time.time() - end)
         end = time.time()
 
+        if args.test:
+            #TODO: Fix - This is not working currently
+            save_list.append({
+                        'loss_dict': loss_dict,
+                        'metadata': input_data['metadata']
+                    })
+
         if (rank == 0) and (idx % args.print_freq == 0):
             progress.display(idx)
 
@@ -211,6 +238,10 @@ def evaluate(loader, model, device, epoch, args):
         for k, v in loss_dict.items():
             if "IoU>=" not in k:
                 args.train_plotter.add_data(f'val/{k}', v.item(), epoch)
+        
+        if args.test:
+            with open(os.path.join(args.log_path, f'test_results_epoch_{epoch}.json'), 'w') as f:
+                json.dump(save_list, f)
     
     if args.test:
         return losses.avg, iou_threshold_meters
@@ -269,9 +300,10 @@ def get_dataset(args):
         hop_length=args.seq_hop,
         use_audio=args.use_audio,
         use_keysteps=args.use_keysteps,
-        views=args.views,
+        views="exo", #We want to validate on only exo views, regardless of training view setup (ego, exo, all, multi, etc.)
         use_distill_nce_loss=args.use_distill_nce_loss,
-        use_center_duration=args.use_center_duration)
+        use_center_duration=args.use_center_duration,
+        multi_view_single_exo_inference=(args.views=="multi"))
 
     train_sampler = DistributedSampler(train_dataset, num_replicas=args.world_size, rank=args.rank)
     val_sampler = DistributedSampler(val_dataset, num_replicas=args.world_size, rank=args.rank)
@@ -286,7 +318,7 @@ def get_dataset(args):
     print("Loading val dataset...")
     val_loader = DataLoaderBG(val_dataset,
         batch_size=args.batch_size, num_workers=args.num_workers,
-        collate_fn=val_dataset.collate_fn, pin_memory=True, drop_last=False,
+        collate_fn=val_dataset.collate_fn, pin_memory=True, drop_last=True, #TODO: Eventually revert this to drop_last=False, there was an issue with last batch that was causing issues
         shuffle=(val_sampler is None), sampler=val_sampler, 
     )
     return train_dataset, val_dataset, train_loader, val_loader
@@ -301,14 +333,15 @@ def get_test_dataset(args):
         use_keysteps=args.use_keysteps,
         views="exo", #fix testing on all exo views
         use_distill_nce_loss=args.use_distill_nce_loss,
-        use_center_duration=args.use_center_duration)
+        use_center_duration=args.use_center_duration,
+        multi_view_single_exo_inference=(args.views=="multi"))
 
     test_sampler = DistributedSampler(test_dataset, num_replicas=args.world_size, rank=args.rank)
 
     print("Loading test dataset...")
     test_loader = DataLoaderBG(test_dataset,
         batch_size=args.batch_size, num_workers=args.num_workers,
-        collate_fn=test_dataset.collate_fn, pin_memory=True, drop_last=False,
+        collate_fn=test_dataset.collate_fn, pin_memory=True, drop_last=True, #TODO: Ditto comment above
         shuffle=False, sampler=test_sampler, 
     )
     return test_loader
@@ -360,7 +393,7 @@ def main(args):
          
         test_loader = get_test_dataset(args)
 
-    assert args.views in ["exo", "ego", "all"] # possible view settings for train/test
+    assert args.views in ["exo", "ego", "all", "multi"] # possible view settings for train/test
 
     ### Model ###
     if args.model in ['init']:
@@ -375,7 +408,8 @@ def main(args):
                         text_embed_dim=args.text_feature_dim,
                         audio_embed_dim=args.audio_feature_dim,
                         feature_dim=args.feature_dim,
-                        use_distill_nce_loss=args.use_distill_nce_loss
+                        use_distill_nce_loss=args.use_distill_nce_loss,
+                        multi_view= args.views == "multi"
         )
     elif args.model in ['cotrain']:
         #deal with this later...it all needs to change
@@ -514,6 +548,11 @@ def main(args):
     for epoch in range(args.start_epoch, args.epochs):
         np.random.seed(epoch)
         random.seed(epoch)
+        train_loader.dataset.set_phase(get_phase(epoch, args.epochs))
+        # Ensure all processes see the same phase
+        #TODO: This is not working - why?
+        if args.distributed:
+            dist.barrier()
         train_loss = train(train_loader, model, optimizer, lr_scheduler, grad_scaler, device, epoch, args)
         val_loss = evaluate(val_loader, model, device, epoch, args) 
 
@@ -581,6 +620,8 @@ train on ego view only: --views ego
 train on exo views only: --views exo
 
 train on all views: --views all
+
+train on multi-views: --views multi
 
 resume training: --resume <PATH_TO_FILE>.tar
 """

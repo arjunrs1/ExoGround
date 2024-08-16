@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=ExoGround_ks_ego_test
+#SBATCH --job-name=ExoGround_ks_multi_test
 #SBATCH --output=/checkpoint/%u/slurm_logs/exoground/test_%j.out
 #SBATCH --error=/checkpoint/%u/slurm_logs/exoground/test_%j.out
 #SBATCH --partition=learnfair
@@ -20,9 +20,8 @@ srun --label torchrun --nproc_per_node=8 \
     --epochs 100 \
     --num_workers 0 \
     --use_keysteps \
-    --views ego \
-    --test /private/home/arjunrs1/exo_narration_grounding/ExoGround/train/log/2024_08_12_20_40_init_iou_l1_egoexo4d_len64_e6d6_pos-learned_textpos-0_policy-default_bs16_lr0.0001_audio=False_decoder=True_keysteps=True_view=ego_meandur=True_distill=False/model/epoch99.pth.tar \
-    --visualize
+    --views multi \
+    --test /private/home/arjunrs1/exo_narration_grounding/ExoGround/train/log/2024_08_15_04_24_init_iou_l1_egoexo4d_len64_e6d6_pos-learned_textpos-0_policy-default_bs16_lr0.0001_audio=False_decoder=True_keysteps=True_view=multi_meandur=True_distill=False/model/epoch65.pth.tar \
 
 ### exo_ks_distill:
 ### /private/home/arjunrs1/exo_narration_grounding/ExoGround/train/log/2024_08_12_20_53_init_iou_l1_egoexo4d_len64_e6d6_pos-learned_textpos-0_policy-default_bs16_lr0.0001_audio=False_decoder=True_keysteps=True_view=exo_meandur=True_distill=True/model/epoch99.pth.tar
