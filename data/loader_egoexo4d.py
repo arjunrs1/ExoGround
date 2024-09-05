@@ -6,6 +6,8 @@ from torch.utils.data.dataloader import default_collate
 import os
 import json
 import ast
+import random
+import itertools
 
 class EgoExo4DDataLoader(Dataset):
     def __init__(self,
@@ -18,6 +20,9 @@ class EgoExo4DDataLoader(Dataset):
                 use_distill_nce_loss=False,
                 use_center_duration=True,
                 multi_view_single_exo_inference=False,
+                multi_view_egoexo=False,
+                num_max_views=None,
+                randomize_narration_order=False,
                 fps=30):
         self.split = split
         self.duration = duration
@@ -29,12 +34,16 @@ class EgoExo4DDataLoader(Dataset):
         self.use_distill_nce_loss = use_distill_nce_loss
         self.use_center_duration = use_center_duration
         self.multi_view_single_exo_inference = multi_view_single_exo_inference
+        self.multi_view_egoexo = multi_view_egoexo
+        self.num_max_views = num_max_views
+        self.randomize_narration_order = randomize_narration_order
         self.fps = fps
         self.base_path = '/private/home/arjunrs1/egoexo4d_features'
         self.vid_feat_rel_path = "checkpoint/yalesong/EgoExo4D_EgoVLPv2_arxivC/extracted_features_egovlp2/EgoVLPv2_Pretraining_bs512-lr3e_5-Ep20"
         self.split_path = f"/private/home/arjunrs1/exo_narration_grounding/splits/egoexo4d_splits/{split}.csv"
         self.annotation_path = f'/private/home/arjunrs1/exo_narration_grounding/data_processing/time_interval_annotation_files/narration_annotations/{split}.csv'
         self.keysteps_annotations_path = f'/private/home/arjunrs1/exo_narration_grounding/data_processing/time_interval_annotation_files/keystep_annotations/{split}.csv'
+        self.takes_path = "/datasets01/egoexo4d/v2/takes/"
 
         self.atomic_take_cam_map_train_path = f'/datasets01/egoexo4d/v2/annotations/atomic_descriptions_train.json'
         self.atomic_take_cam_map_test_path = f'/datasets01/egoexo4d/v2/annotations/atomic_descriptions_val.json'
@@ -57,112 +66,14 @@ class EgoExo4DDataLoader(Dataset):
         self.narration_feature_path = os.path.join(self.base_path, 'narration_features')
         if self.use_keysteps:
             self.narration_feature_path = os.path.join(self.narration_feature_path, "keystep_features")
-
+        if self.multi_view or self.multi_view_single_exo_inference:
+            if self.multi_view_egoexo:
+                self.view_map = {"aria": 0, "cam01": 1, "gp01": 1, "cam02": 2, "gp02":2, "cam03": 3, "gp03": 3, "cam04": 4, "gp04": 4, "cam05": 5, "gp05": 5, "gp06": 6}
+            else:
+                self.view_map = {"cam01": 0, "gp01": 0, "cam02": 1, "gp02":1, "cam03": 2, "gp03": 2, "cam04": 3, "gp04": 3, "cam05": 4, "gp05": 4, "gp06": 5}
         self.current_phase = 0
         self.window_csv_path = os.path.join(self.base_path, f'{split}_{views}_ks={use_keysteps}_windows.csv')
         self.precompute_windows()
-        
-
-    """ def precompute_windows_old(self):
-        if not os.path.exists(self.window_csv_path):
-            print("Computing windows...")
-            windows = []
-            for _, row in self.split_data.iterrows():
-                video_id = row['take_name']
-                take_uid = row['take_uid']
-                duration_sec = int(row['duration_sec'])
-                exo_cams = list(self.atomic_take_cam_map_train[take_uid].values())
-                ego_cam = row['ego_camera_path'].split("/")[-1].split(".")[0]
-                if self.views == "exo":
-                    cams = exo_cams
-                elif self.views == "ego":
-                    cams = [ego_cam]
-                else:
-                    cams = exo_cams
-                    cams.append(ego_cam)
-                for exo_cam in cams:
-                    max_start_sec = int(duration_sec) - self.duration
-                    for start_sec in range(0, max_start_sec + 1, self.hop_length):
-                        end_sec = start_sec + self.duration
-                        narrations = self.annotations[
-                            (self.annotations['take_uid'] == video_id) &
-                            (self.annotations['start_frame'] / self.fps <= end_sec) &
-                            (self.annotations['end_frame'] / self.fps >= start_sec)
-                        ]
-                        narration_ids = [row['unique_narration_id'] for _, row in narrations.iterrows() if os.path.exists(os.path.join(self.narration_feature_path, video_id, f"{row['unique_narration_id']}.pt"))]
-                        if len(narrations) != 0:
-                            windows.append([video_id, exo_cam, ego_cam, start_sec, end_sec, ','.join(narration_ids)])
-            windows_df = pd.DataFrame(windows, columns=['video_id', 'exo_cam', 'ego_cam', 'start_sec', 'end_sec', 'narration_ids'])
-            windows_df.to_csv(self.window_csv_path, index=False)
-            self.windows = windows_df
-        else:
-            print("Loading windows...")
-            self.windows = pd.read_csv(self.window_csv_path)
-        print(f"Number of {self.split} windows:")
-        print(len(self.windows)) """
-
-    def precompute_windows(self):
-        if not os.path.exists(self.window_csv_path):
-            print("Computing windows...")
-            windows = []
-            for _, row in self.split_data.iterrows():
-                video_id = row['take_name']
-                take_uid = row['take_uid']
-                duration_sec = int(row['duration_sec'])
-                exo_cams = list(self.atomic_take_cam_map_train[take_uid].values())
-                ego_cam = row['ego_camera_path'].split("/")[-1].split(".")[0]
-                cams = exo_cams if self.views == "exo" else ([ego_cam] if self.views == "ego" else exo_cams + [ego_cam])
-
-                max_start_sec = int(duration_sec) - self.duration
-                for start_sec in range(0, max_start_sec + 1, self.hop_length):
-                    end_sec = start_sec + self.duration
-                    narrations = self.annotations[
-                        (self.annotations['take_uid'] == video_id) &
-                        (self.annotations['start_frame'] / self.fps <= end_sec) &
-                        (self.annotations['end_frame'] / self.fps >= start_sec)
-                    ]
-                    narration_ids = [row['unique_narration_id'] for _, row in narrations.iterrows() if os.path.exists(os.path.join(self.narration_feature_path, video_id, f"{row['unique_narration_id']}.pt"))]
-                    if len(narrations) != 0:
-                        if self.multi_view:
-                            windows.append([video_id, exo_cams, ego_cam, start_sec, end_sec, ','.join(narration_ids)])
-                        else:
-                            for exo_cam in cams:
-                                windows.append([video_id, exo_cam, ego_cam, start_sec, end_sec, ','.join(narration_ids)])
-            columns = ['video_id', 'exo_cam', 'ego_cam', 'start_sec', 'end_sec', 'narration_ids']
-            windows_df = pd.DataFrame(windows, columns=columns)
-            windows_df.to_csv(self.window_csv_path, index=False)
-            self.windows = windows_df
-        else:
-            print("Loading windows...")
-            self.windows = pd.read_csv(self.window_csv_path)
-        print(f"Number of {self.split} windows:")
-        print(len(self.windows))
-    
-    def set_phase(self, phase):
-        self.current_phase = phase
-        print("CURRRENT PHASE:")
-        print(self.current_phase)
-
-    def create_video_mask(self, exo_cams):
-        num_views = len(exo_cams)
-        # Total length of the mask is the number of views times the hop_length
-        mask_length = num_views * self.duration
-        mask = torch.zeros(mask_length, dtype=torch.bool)
-        # Number of views to mask is determined by the current phase
-        if self.current_phase > 0:
-            if num_views == 6:
-                masked_views = np.random.choice(num_views, self.current_phase, replace=False)
-            elif num_views == 4 and self.current_phase > 2:
-                masked_views = np.random.choice(num_views, self.current_phase-2, replace=False)
-            for view in masked_views:
-                start_idx = view * self.hop_length
-                end_idx = start_idx + self.hop_length
-                mask[start_idx:end_idx] = True
-        #TODO: Read model.py again and verify nothing there needs to change
-        if num_views < 6:
-            mask_pad = torch.ones((6-num_views)*self.duration, dtype=bool)
-            mask = torch.concat((mask, mask_pad))
-        return mask
 
     def __len__(self):
         return len(self.windows)
@@ -181,12 +92,83 @@ class EgoExo4DDataLoader(Dataset):
         collated_data['metadata'] = collated_metadata
         return collated_data
 
+    def set_phase(self, phase):
+        self.current_phase = phase
+
+    def precompute_windows(self):
+        if not os.path.exists(self.window_csv_path):
+            print("Computing windows...")
+            windows = []
+            for _, row in self.split_data.iterrows():
+                video_id = row['take_name']
+                take_uid = row['take_uid']
+                duration_sec = int(row['duration_sec'])
+                exo_cams = [cam.split(".")[0] for cam in os.listdir(os.path.join(self.takes_path, video_id, "frame_aligned_videos")) if (".mp4" in cam.lower()) and ("aria" not in cam.lower())]
+                ego_cam = row['ego_camera_path'].split("/")[-1].split(".")[0]
+                cams = exo_cams if self.views == "exo" else ([ego_cam] if self.views == "ego" else [ego_cam] + exo_cams)
+
+                max_start_sec = int(duration_sec) - self.duration
+                for start_sec in range(0, max_start_sec + 1, self.hop_length):
+                    end_sec = start_sec + self.duration
+                    narrations = self.annotations[
+                        (self.annotations['take_uid'] == video_id) &
+                        (self.annotations['start_frame'] / self.fps <= end_sec) &
+                        (self.annotations['end_frame'] / self.fps >= start_sec)
+                    ]
+                    narration_ids = [row['unique_narration_id'] for _, row in narrations.iterrows() if os.path.exists(os.path.join(self.narration_feature_path, video_id, f"{row['unique_narration_id']}.pt"))]
+                    if len(narrations) != 0:
+                        if self.multi_view:
+                            windows.append([video_id, cams if self.multi_view_egoexo else exo_cams, ego_cam, start_sec, end_sec, ','.join(narration_ids)])
+                        else:
+                            for cam1, cam2 in list(itertools.permutations(cams, 2)):
+                                windows.append([video_id, cam1, cam2, start_sec, end_sec, ','.join(narration_ids)])
+            columns = ['video_id', 'exo_cam', 'ego_cam', 'start_sec', 'end_sec', 'narration_ids']
+            windows_df = pd.DataFrame(windows, columns=columns)
+            windows_df.to_csv(self.window_csv_path, index=False)
+            self.windows = windows_df
+        else:
+            print("Loading windows...")
+            self.windows = pd.read_csv(self.window_csv_path)
+        print(f"Number of {self.split} windows:")
+        print(len(self.windows))
+
+    def get_view_idx(self, exo_cam):
+        if "aria" in exo_cam.lower():
+            assert self.multi_view_egoexo
+            return 0
+        return self.view_map[exo_cam]
+
+    def create_video_mask(self, exo_cams):
+        num_views = len(exo_cams)
+
+        #Initialize mask with all available views:
+        mask = torch.ones(self.num_max_views * self.duration, dtype=torch.bool)
+        for cam in exo_cams:
+            start_idx = self.get_view_idx(cam) * self.duration
+            end_idx = start_idx + self.duration
+            mask[start_idx:end_idx] = False
+
+        #if masking, then mask out from existing views:
+        if self.current_phase > 0:
+            if num_views == self.num_max_views:
+                masked_views = np.random.choice(exo_cams, self.current_phase, replace=False)
+            elif num_views < self.num_max_views and self.current_phase > (self.num_max_views-num_views):
+                masked_views = np.random.choice(exo_cams, self.current_phase-(self.num_max_views-num_views), replace=False)
+            else:
+                masked_views = None
+            if masked_views is not None:
+                for view in masked_views:
+                    start_idx = self.get_view_idx(view) * self.duration
+                    end_idx = start_idx + self.duration
+                    mask[start_idx:end_idx] = True
+        return mask
+
     def create_view_available_mask(self, exo_cams):
-        total_length = 6 * self.duration
-        mask_length = len(exo_cams) * self.duration
-        mask = torch.ones(total_length, dtype=torch.bool)
-        if len(exo_cams) < 6:
-            mask[mask_length:] = False
+        mask = torch.zeros(self.num_max_views * self.duration, dtype=torch.bool)
+        for cam in exo_cams:
+            start_idx = self.get_view_idx(cam) * self.duration
+            end_idx = start_idx + self.duration
+            mask[start_idx:end_idx] = True
         return mask
 
     def __getitem__(self, idx):
@@ -202,32 +184,30 @@ class EgoExo4DDataLoader(Dataset):
             take_exo_id = f"{video_id}_{exo_cam}"
             features = torch.load(os.path.join(self.video_feature_path, f"{take_exo_id}.pt"))[start_sec:end_sec]
             video_features_list.append(features)
-        video_features = torch.cat(video_features_list, dim=0)
-
-        #right pad the non-existing exo cameras if they don't exist
-        if self.multi_view and len(exo_cams) < 6:
-            rows_to_add = (6-len(exo_cams))*self.duration
-            padding_tensor = torch.ones(rows_to_add, video_features.shape[-1])
-            video_features = torch.cat((video_features, padding_tensor), dim=0)
+    
+        if self.multi_view:
+            full_video_feat_len = (self.num_max_views)*self.duration
+            video_features = torch.ones(full_video_feat_len, features.shape[-1])
+            for cam, feats in zip(exo_cams, video_features_list):
+                start_idx = self.get_view_idx(cam) * self.duration
+                end_idx = start_idx + self.duration
+            video_features[start_idx:end_idx,:] = feats
+        else:
+            video_features = torch.cat(video_features_list, dim=0)
 
         #Pad single exo view according to multi-view setting for evaluating multi-view model on single-view inference mode
         if self.multi_view_single_exo_inference:
             assert len(exo_cams) == 1
-            take_uid = self.split_data[self.split_data['take_name'] == video_id].iloc[0]['take_uid']
-            if self.split == "val":
-                index = list(self.atomic_take_cam_map_train[take_uid].values()).index(exo_cams[0])
-            else:
-                index = list(self.atomic_take_cam_map_test[take_uid].values()).index(exo_cams[0])
-            assert 0 <= index < 6
+            index = self.get_view_idx(exo_cams[0])
             rows_left = index * self.duration
-            rows_right = (6-index-1)*self.duration
+            rows_right = (self.num_max_views-index-1) * self.duration
             l_pad = torch.ones(rows_left, video_features.shape[-1])
             r_pad = torch.ones(rows_right, video_features.shape[-1])
             video_features = torch.cat((l_pad, video_features, r_pad), dim=0)
-            single_exo_mask = torch.ones(6 * self.duration, dtype=torch.bool)
-            exo_view_start_idx = index*self.duration
-            exo_view_end_idx = exo_view_start_idx + self.duration
-            single_exo_mask[exo_view_start_idx:exo_view_end_idx] = False
+            single_exo_mask = torch.ones(self.num_max_views * self.duration, dtype=torch.bool)
+            exo_view_end_idx = rows_left + self.duration
+            single_exo_mask[rows_left:exo_view_end_idx] = False
+            #Mask is false where valid video features are, and True otherwise (padding mask format)
             
 
         if self.use_distill_nce_loss:
@@ -263,6 +243,13 @@ class EgoExo4DDataLoader(Dataset):
         narration_texts = narration_texts[:self.duration]
         starts = starts[:self.duration]
         ends = ends[:self.duration]
+
+        # Randomize the order of narrations if the flag is set
+        if self.randomize_narration_order:
+            combined = list(zip(narration_texts, starts, ends, narration_features))
+            random.shuffle(combined)
+            narration_texts, starts, ends, narration_features = zip(*combined)
+            narration_texts, starts, ends, narration_features = list(narration_texts), list(starts), list(ends), list(narration_features)
 
         padded_narration_features = torch.zeros(int(self.duration), 1, 4096) 
         padded_starts = torch.zeros(int(self.duration),1)

@@ -28,9 +28,8 @@ from utils.train_utils import clip_gradients
 from utils.utils import AverageMeter, save_checkpoint, neq_load_customized, \
 calc_topk_accuracy, ProgressMeter, neq_load_customized, save_runtime_checkpoint, MovingAverage
 
-def get_phase(epoch, total_epochs, num_phases=6):
+def get_phase(epoch, total_epochs, num_phases):
     # Divide the total epochs by the number of phases to determine the length of each phase
-    #TODO: Fix - phase is not updating during training currently
     phase_length = total_epochs // num_phases
     current_phase = epoch // phase_length
     return current_phase
@@ -95,7 +94,7 @@ def train(loader, model, optimizer, lr_scheduler, grad_scaler, device, epoch, ar
                 )
                 logits = {**logits, **{f'ema-{k}':v for k,v in logits_ema.items()}}
 
-            loss_dict = get_loss(input_data=input_data,
+            loss_dict, _ = get_loss(input_data=input_data,
                                  text_padding_mask=text_padding_mask,
                                  logits=logits, 
                                  args=args)
@@ -202,7 +201,7 @@ def evaluate(loader, model, device, epoch, args):
                        egocentric_video_embed=ego_seq,
                        view_mask=view_mask)
 
-        loss_dict = get_loss(input_data=input_data,
+        loss_dict, ious = get_loss(input_data=input_data,
                                  text_padding_mask=text_padding_mask,
                                  logits=logits, 
                                  args=args)
@@ -218,10 +217,11 @@ def evaluate(loader, model, device, epoch, args):
         end = time.time()
 
         if args.test:
-            #TODO: Fix - This is not working currently
             save_list.append({
-                        'loss_dict': loss_dict,
-                        'metadata': input_data['metadata']
+                        'loss_dict': ious.cpu().detach().tolist(),
+                        'metadata': {"narration": input_data['metadata']['narrations'], 
+                                     "video_id": input_data['metadata']['video_id'],
+                                     "cam_id": input_data['metadata']['exo_camera']}
                     })
 
         if (rank == 0) and (idx % args.print_freq == 0):
@@ -293,7 +293,10 @@ def get_dataset(args):
         use_keysteps=args.use_keysteps,
         views=args.views,
         use_distill_nce_loss=args.use_distill_nce_loss,
-        use_center_duration=args.use_center_duration)
+        use_center_duration=args.use_center_duration,
+        multi_view_egoexo=args.multi_view_egoexo,
+        num_max_views=args.num_max_views,
+        randomize_narration_order=args.randomize_narration_order)
     val_dataset = D(
         split="val",
         duration=args.seq_len,
@@ -303,7 +306,10 @@ def get_dataset(args):
         views="exo", #We want to validate on only exo views, regardless of training view setup (ego, exo, all, multi, etc.)
         use_distill_nce_loss=args.use_distill_nce_loss,
         use_center_duration=args.use_center_duration,
-        multi_view_single_exo_inference=(args.views=="multi"))
+        multi_view_single_exo_inference=(args.views=="multi"),
+        multi_view_egoexo=args.multi_view_egoexo,
+        num_max_views=args.num_max_views,
+        randomize_narration_order=False)
 
     train_sampler = DistributedSampler(train_dataset, num_replicas=args.world_size, rank=args.rank)
     val_sampler = DistributedSampler(val_dataset, num_replicas=args.world_size, rank=args.rank)
@@ -334,7 +340,10 @@ def get_test_dataset(args):
         views="exo", #fix testing on all exo views
         use_distill_nce_loss=args.use_distill_nce_loss,
         use_center_duration=args.use_center_duration,
-        multi_view_single_exo_inference=(args.views=="multi"))
+        multi_view_single_exo_inference=(args.views=="multi"),
+        multi_view_egoexo=args.multi_view_egoexo,
+        num_max_views=args.num_max_views,
+        randomize_narration_order=False)
 
     test_sampler = DistributedSampler(test_dataset, num_replicas=args.world_size, rank=args.rank)
 
@@ -383,6 +392,23 @@ def main(args):
     if args.model == 'init':
         pass #TODO: This does nothing right now...eventually add functionality for cotraining/student-teacher training
 
+    #Ensure we are not including ego in backbone and distilling ego into views
+    assert not (args.multi_view_egoexo and args.use_distill_nce_loss)
+
+    if args.use_pairwise_distill_nce_loss:
+        assert args.views == "multi"
+
+    assert args.pairwise_distill_mode in ["all", "unmasked"]
+    assert args.views in ["exo", "ego", "all", "multi"]
+
+    #ensure we are only including ego view in multi-view training if we are doing multi-view training
+    if args.multi_view_egoexo:
+        assert args.views == "multi"
+
+    args.num_max_views = 1 if not args.views == "multi" else args.num_max_views
+    if args.multi_view_egoexo:
+        args.num_max_views +=1 
+
     if not args.test:
         _, _, train_loader, val_loader = get_dataset(args)
 
@@ -393,7 +419,7 @@ def main(args):
          
         test_loader = get_test_dataset(args)
 
-    assert args.views in ["exo", "ego", "all", "multi"] # possible view settings for train/test
+    
 
     ### Model ###
     if args.model in ['init']:
@@ -409,7 +435,10 @@ def main(args):
                         audio_embed_dim=args.audio_feature_dim,
                         feature_dim=args.feature_dim,
                         use_distill_nce_loss=args.use_distill_nce_loss,
-                        multi_view= args.views == "multi"
+                        multi_view= args.views == "multi",
+                        num_max_views=args.num_max_views,
+                        use_pairwise_distill_nce_loss=args.use_pairwise_distill_nce_loss,
+                        pairwise_distill_mode=args.pairwise_distill_mode
         )
     elif args.model in ['cotrain']:
         #deal with this later...it all needs to change
@@ -541,16 +570,15 @@ def main(args):
     args.prof = None
     
     print('Main loop starts')
-    #moving_average = MovingAverage(size=5)  # Adjust size to your needs
+    #moving_average = MovingAverage(size=10)  # Adjust size to your needs
     #best_val_loss = float('inf')
     #patience = 10
     #epochs_no_improve = 0
     for epoch in range(args.start_epoch, args.epochs):
         np.random.seed(epoch)
         random.seed(epoch)
-        train_loader.dataset.set_phase(get_phase(epoch, args.epochs))
-        # Ensure all processes see the same phase
-        #TODO: This is not working - why?
+        if args.views == "multi":
+            train_loader.dataset.set_phase(get_phase(epoch=epoch, total_epochs=args.epochs, num_phases=args.num_max_views))
         if args.distributed:
             dist.barrier()
         train_loss = train(train_loader, model, optimizer, lr_scheduler, grad_scaler, device, epoch, args)
@@ -599,10 +627,10 @@ if __name__ == "__main__":
     main(args)
 
 """
-train keysteps (no audio):
+train keysteps:
 torchrun --nproc_per_node=8 main_egoexo4d_distributed.py --batch_size 16 --epochs 100 --num_workers 0 --use_keysteps
 
-test keysteps (no audio):
+test keysteps:
 # torchrun --nproc_per_node=8 main_egoexo4d_distributed.py --batch_size 16 --test <PATH_TO_PTH_FILE>.tar --num_workers 0 --use_keysteps
 
 flags:

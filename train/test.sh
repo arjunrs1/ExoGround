@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=ExoGround_ks_multi_test
+#SBATCH --job-name=ExoGround_ks_all_test
 #SBATCH --output=/checkpoint/%u/slurm_logs/exoground/test_%j.out
 #SBATCH --error=/checkpoint/%u/slurm_logs/exoground/test_%j.out
 #SBATCH --partition=learnfair
@@ -17,11 +17,43 @@ source activate sounding_narrations
 srun --label torchrun --nproc_per_node=8 \
     main_egoexo4d_distributed.py \
     --batch_size 16 \
-    --epochs 100 \
+    --epochs 700 \
     --num_workers 0 \
     --use_keysteps \
-    --views multi \
-    --test /private/home/arjunrs1/exo_narration_grounding/ExoGround/train/log/2024_08_15_04_24_init_iou_l1_egoexo4d_len64_e6d6_pos-learned_textpos-0_policy-default_bs16_lr0.0001_audio=False_decoder=True_keysteps=True_view=multi_meandur=True_distill=False/model/epoch65.pth.tar \
+    --views all \
+    --use_distill_nce_loss \
+    --test /private/home/arjunrs1/exo_narration_grounding/ExoGround/train/log/2024_09_03_05_02_init_iou_l1_egoexo4d_len64_e6d6_pos-learned_textpos-0_policy-default_bs16_lr0.0001_audio=False_decoder=True_keysteps=True_view=all_meandur=True_distill=True_pair_ds=False_pair_ds_mode=all_multi_ego=False_narr_rand=False/model/epoch50.pth.tar \
+    --visualize
+
+### view 1 view 2 (no distill):
+### /private/home/arjunrs1/exo_narration_grounding/ExoGround/train/log/2024_09_03_05_05_init_iou_l1_egoexo4d_len64_e6d6_pos-learned_textpos-0_policy-default_bs16_lr0.0001_audio=False_decoder=True_keysteps=True_view=all_meandur=True_distill=False_pair_ds=False_pair_ds_mode=all_multi_ego=False_narr_rand=False/model/epoch51.pth.tar
+
+
+### all:
+### /private/home/arjunrs1/exo_narration_grounding/ExoGround/train/log/2024_08_27_16_29_init_iou_l1_egoexo4d_len64_e6d6_pos-learned_textpos-0_policy-default_bs16_lr0.0001_audio=False_decoder=True_keysteps=True_view=all_meandur=True_distill=False_pair_ds=False_pair_ds_mode=all_multi_ego=False_narr_rand=False/model/epoch43.pth.tar
+
+### all rand:
+### /private/home/arjunrs1/exo_narration_grounding/ExoGround/train/log/2024_08_27_16_29_init_iou_l1_egoexo4d_len64_e6d6_pos-learned_textpos-0_policy-default_bs16_lr0.0001_audio=False_decoder=True_keysteps=True_view=all_meandur=True_distill=False_pair_ds=False_pair_ds_mode=all_multi_ego=False_narr_rand=True/model/epoch52.pth.tar
+
+### multi egoexo rand
+### /private/home/arjunrs1/exo_narration_grounding/ExoGround/train/log/2024_08_27_16_32_init_iou_l1_egoexo4d_len64_e6d6_pos-learned_textpos-0_policy-default_bs16_lr0.0001_audio=False_decoder=True_keysteps=True_view=multi_meandur=True_distill=False_pair_ds=False_pair_ds_mode=all_multi_ego=True_narr_rand=True/model/model_best_epoch86.pth.tar
+
+### multi egoexo unmasked rand 31581327
+### /private/home/arjunrs1/exo_narration_grounding/ExoGround/train/log/2024_08_27_16_31_init_iou_l1_egoexo4d_len64_e6d6_pos-learned_textpos-0_policy-default_bs16_lr0.0001_audio=False_decoder=True_keysteps=True_view=multi_meandur=True_distill=False_pair_ds=True_pair_ds_mode=unmasked_multi_ego=True_narr_rand=True/model/epoch47.pth.tar
+
+#### multi egoexo unmasked 31581433
+### /private/home/arjunrs1/exo_narration_grounding/ExoGround/train/log/2024_08_27_16_31_init_iou_l1_egoexo4d_len64_e6d6_pos-learned_textpos-0_policy-default_bs16_lr0.0001_audio=False_decoder=True_keysteps=True_view=multi_meandur=True_distill=False_pair_ds=True_pair_ds_mode=unmasked_multi_ego=True_narr_rand=False/model/epoch47.pth.tar
+
+### multi egoexo all 31581455
+### /private/home/arjunrs1/exo_narration_grounding/ExoGround/train/log/2024_08_27_16_30_init_iou_l1_egoexo4d_len64_e6d6_pos-learned_textpos-0_policy-default_bs16_lr0.0001_audio=False_decoder=True_keysteps=True_view=multi_meandur=True_distill=False_pair_ds=True_pair_ds_mode=all_multi_ego=True_narr_rand=False/model/epoch47.pth.tar
+
+### multi egoexo 31581595
+### /private/home/arjunrs1/exo_narration_grounding/ExoGround/train/log/2024_08_27_16_30_init_iou_l1_egoexo4d_len64_e6d6_pos-learned_textpos-0_policy-default_bs16_lr0.0001_audio=False_decoder=True_keysteps=True_view=multi_meandur=True_distill=False_pair_ds=False_pair_ds_mode=all_multi_ego=True_narr_rand=False/model/epoch104.pth.tar
+
+
+
+
+###OLD ONES:
 
 ### exo_ks_distill:
 ### /private/home/arjunrs1/exo_narration_grounding/ExoGround/train/log/2024_08_12_20_53_init_iou_l1_egoexo4d_len64_e6d6_pos-learned_textpos-0_policy-default_bs16_lr0.0001_audio=False_decoder=True_keysteps=True_view=exo_meandur=True_distill=True/model/epoch99.pth.tar

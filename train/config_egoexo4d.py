@@ -55,8 +55,13 @@ def parse_args():
     parser.add_argument('--use_audio', action='store_true', default=False)
     parser.add_argument('--use_keysteps', action='store_true', default=False)
     parser.add_argument('--use_distill_nce_loss', action='store_true', default=False)
+    parser.add_argument('--use_pairwise_distill_nce_loss', action='store_true', default=False)
+    parser.add_argument('--pairwise_distill_mode', default='all', type=str) #options: "all", "unmasked"
     parser.add_argument('--use_center_duration', action='store_true', default=True)
     parser.add_argument('--views', default='exo', type=str)
+    parser.add_argument('--num_max_views', default=6, type=int) #6 for EgoExo4D
+    parser.add_argument('--multi_view_egoexo', action='store_true', default=False)
+    parser.add_argument('--randomize_narration_order', action='store_true', default=False)
 
     #data dimensions
     parser.add_argument('--video_feature_dim', default=4096, type=int)
@@ -89,8 +94,16 @@ def set_path(args):
         name_prefix = f"{args.name_prefix}_" if args.name_prefix else ""
         exp_path = (f"log{args.prefix}/{name_prefix}{dt_string}_"
             f"{args.model}_{args.loss}_{args.dataset}_len{args.seq_len}_"
-            f"e{args.num_encoder_layers}d{args.num_decoder_layers}_pos-{args.pos_enc}_textpos-{args.use_text_pos_enc}_policy-{args.optim_policy}_"
-            f"bs{args.batch_size}_lr{args.lr}_audio={args.use_audio}_decoder={args.use_decoder}_keysteps={args.use_keysteps}_view={args.views}_meandur={args.use_center_duration}_distill={args.use_distill_nce_loss}"
+            f"e{args.num_encoder_layers}d{args.num_decoder_layers}_pos-{args.pos_enc}_"
+            f"textpos-{args.use_text_pos_enc}_policy-{args.optim_policy}_"
+            f"bs{args.batch_size}_lr{args.lr}_audio={args.use_audio}_"
+            f"decoder={args.use_decoder}_keysteps={args.use_keysteps}_"
+            f"view={args.views}_meandur={args.use_center_duration}_"
+            f"distill={args.use_distill_nce_loss}_"
+            f"pair_ds={args.use_pairwise_distill_nce_loss}_"
+            f"pair_ds_mode={args.pairwise_distill_mode}_"
+            f"multi_ego={args.multi_view_egoexo}_"
+            f"narr_rand={args.randomize_narration_order}"
             )
 
     log_path = os.path.join(exp_path, 'log')

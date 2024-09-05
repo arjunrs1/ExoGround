@@ -25,6 +25,9 @@ class ExoGroundingTransformer(nn.Module):
                  feature_dim=512,
                  use_distill_nce_loss=False,
                  multi_view=False,
+                 num_max_views=1,
+                 use_pairwise_distill_nce_loss=False,
+                 pairwise_distill_mode="all"
                  ):
         super().__init__()
 
@@ -44,6 +47,9 @@ class ExoGroundingTransformer(nn.Module):
         self.feature_dim = feature_dim
         self.use_distill_nce_loss = use_distill_nce_loss
         self.multi_view = multi_view
+        self.num_max_views = num_max_views
+        self.use_pairwise_distill_nce_loss = use_pairwise_distill_nce_loss
+        self.pairwise_distill_mode = pairwise_distill_mode
 
         #initalize multi-modal encoder and narration decoder
         self.tfm_modules = []
@@ -65,7 +71,7 @@ class ExoGroundingTransformer(nn.Module):
         self.ln_joint_post_enc = LayerNorm(self.feature_dim)
 
         #initialize exo projection layer for infoNCE loss
-        if self.use_distill_nce_loss:
+        if self.use_distill_nce_loss or self.use_pairwise_distill_nce_loss:
             self.exo_feature_proj = nn.Linear(self.feature_dim, self.video_embed_dim)
 
         #initialize audio embeddings and projection layers
@@ -148,7 +154,11 @@ class ExoGroundingTransformer(nn.Module):
         if self.use_distill_nce_loss and egocentric_video_embed is not None:
             exo_features = all_output[:, :, :T].mean(dim=1)
             exo_features_projected = self.exo_feature_proj(exo_features)
-            distill_loss = self.compute_info_nce_loss(exo_features_projected, egocentric_video_embed, view_mask=view_mask)
+            distill_loss = self.compute_info_nce_loss(exo_features_projected, egocentric_video_embed)
+        elif self.multi_view and self.use_pairwise_distill_nce_loss:
+            exo_features = all_output[:, :, :T].mean(dim=1)
+            exo_features_projected = self.exo_feature_proj(exo_features)
+            distill_loss = self.compute_pairwise_info_nce_loss(exo_features_projected, view_mask=view_mask if self.pairwise_distill_mode == "all" else ~video_padding_mask)
 
         if self.use_decoder:
             decoder_output = self.decoder(x=text_features[:,-1,::].permute(1, 0, 2), memory=decoder_context[:,-1,::].permute(1, 0, 2), tgt_key_padding_mask=lang_padding_mask, memory_key_padding_mask=video_padding_mask)
@@ -160,49 +170,12 @@ class ExoGroundingTransformer(nn.Module):
             grounding = self.grounding_head(text_features)
 
         output_dict = {'interval_preds': grounding}
-        if self.use_distill_nce_loss:
+        if self.use_distill_nce_loss or self.use_pairwise_distill_nce_loss:
             output_dict['distill_infonce_loss'] = distill_loss
 
         return output_dict
-    
-    """ def compute_info_nce_loss(self, features, positive_features, temperature=0.1, view_mask=None, num_splits=6):
-        
-        Compute the InfoNCE loss between features and positive features, considering both positive and negative samples.
-        
-        Args:
-        - features (torch.Tensor): Tensor of shape (batch_size, num_features, feature_dim)
-        - positive_features (torch.Tensor): Tensor of shape (batch_size, num_features, feature_dim)
-        - temperature (float): A temperature scaling factor (default 0.1)
-        - view_mask (torch.Tensor): Boolean tensor of shape (batch_size, num_features) indicating available views
-        
-        Returns:
-        - torch.Tensor: Scalar tensor containing the InfoNCE loss.
-        
-        # Split the features tensor into 6 parts along the second dimension, else use the features as is if not multi-view
-        split_features = torch.chunk(features, num_splits, dim=1) if self.multi_view else [features]
-        total_loss = 0.0
-        for exo_features in split_features:
-            assert exo_features.shape(1) == positive_features.shape(1)
-            # Normalize features to get unit vectors
-            features_norm = F.normalize(features, p=2, dim=2)
-            positive_features_norm = F.normalize(positive_features, p=2, dim=2)
-            # Compute similarities
-            # Transpose positive features to align with features for matrix multiplication
-            similarities = torch.bmm(features_norm, positive_features_norm.transpose(1, 2)) / temperature
-            # Create labels for the positive samples (diagonal elements in the batch)
-            labels = torch.arange(positive_features.shape(1)).to(features.device)
-            # Use log-softmax for numerical stability
-            log_prob = F.log_softmax(similarities, dim=2)
-            # Gather the log probabilities of positive samples
-            log_prob_positive = log_prob.gather(2, labels.view(1, -1).expand(features.size(0), -1).unsqueeze(2)).squeeze(2)
-            # Compute the mean of the log probabilities of the positive samples
-            nce_loss = -log_prob_positive.mean()
-            total_loss += nce_loss
-        # Average the loss across all pairs
-        mean_nce_loss = total_loss / len(split_features)
-        return mean_nce_loss """
 
-    def compute_info_nce_loss(self, features, positive_features, temperature=0.1, view_mask=None, num_splits=6):
+    def compute_info_nce_loss(self, features, positive_features, temperature=0.1):
         """
         Compute the InfoNCE loss between features and positive features, considering both positive and negative samples.
         
@@ -215,40 +188,79 @@ class ExoGroundingTransformer(nn.Module):
         Returns:
         - torch.Tensor: Scalar tensor containing the InfoNCE loss.
         """
-        # Split the features tensor into 6 parts along the second dimension, else use the features as is if not multi-view
-        split_features = torch.chunk(features, num_splits, dim=1) if self.multi_view else [features]
-        split_masks = torch.chunk(view_mask, num_splits, dim=1) if self.multi_view else [view_mask]
+        assert features.size(1) == positive_features.size(1)
+        # Normalize features to get unit vectors
+        features_norm = F.normalize(features, p=2, dim=2)
+        positive_features_norm = F.normalize(positive_features, p=2, dim=2)
+        # Compute similarities
+        # Transpose positive features to align with features for matrix multiplication
+        similarities = torch.bmm(features_norm, positive_features_norm.transpose(1, 2)) / temperature
+        # Create labels for the positive samples (diagonal elements in the batch)
+        labels = torch.arange(positive_features.size(1)).to(features.device)
+        # Use log-softmax for numerical stability
+        log_prob = F.log_softmax(similarities, dim=2)
+        # Gather the log probabilities of positive samples
+        log_prob_positive = log_prob.gather(2, labels.view(1, -1).expand(features.size(0), -1).unsqueeze(2)).squeeze(2)
+        # Compute the mean of the log probabilities of the positive samples
+        nce_loss = -log_prob_positive.mean()
+        return nce_loss
+
+    def compute_pairwise_info_nce_loss(self, features, temperature=0.1, view_mask=None):
+        """
+        Compute the pairwise InfoNCE loss between all pairs of unmasked views for each item in the batch.
+        
+        Args:
+        - features (torch.Tensor): Tensor of shape (batch_size, num_features, feature_dim)
+        - temperature (float): A temperature scaling factor (default 0.1)
+        - view_mask (torch.Tensor): Boolean tensor of shape (batch_size, num_features) indicating available views
+        - num_splits (int): Number of splits along the feature dimension
+        
+        Returns:
+        - torch.Tensor: Scalar tensor containing the average pairwise InfoNCE loss.
+        """
+        # Split the features tensor and the view mask into parts along the second dimension
+        split_features = torch.chunk(features, self.num_max_views, dim=1)
+        split_masks = torch.chunk(view_mask, self.num_max_views, dim=1)
         
         total_loss = 0.0
-        valid_chunks = 0
-        for exo_features, mask in zip(split_features, split_masks):
-            if mask.any():  # Check if there is at least one True value in the mask
-                masked_exo_features = exo_features[mask].view(exo_features.size(0), -1, exo_features.size(-1))
-                masked_positive_features = positive_features[mask].view(positive_features.size(0), -1, positive_features.size(-1))
-                
-                # Normalize features to get unit vectors
-                features_norm = F.normalize(masked_exo_features, p=2, dim=2)
-                positive_features_norm = F.normalize(masked_positive_features, p=2, dim=2)
-                
-                # Compute similarities
-                # Transpose positive features to align with features for matrix multiplication
-                similarities = torch.bmm(features_norm, positive_features_norm.transpose(1, 2)) / temperature
-                # Create labels for the positive samples (diagonal elements in the batch)
-                labels = torch.arange(masked_positive_features.shape[1]).to(features.device)
-                
-                # Use log-softmax for numerical stability
-                log_prob = F.log_softmax(similarities, dim=2)
-                # Gather the log probabilities of positive samples
-                log_prob_positive = log_prob.gather(2, labels.view(1, -1).expand(masked_exo_features.shape[0], -1).unsqueeze(2)).squeeze(2)
-                
-                # Compute the mean of the log probabilities of the positive samples
-                nce_loss = -log_prob_positive.mean()
-                
-                total_loss += nce_loss
-                valid_chunks += 1
+        num_valid_pairs = 0
         
-        # Average the loss across all pairs
-        final_loss = total_loss / valid_chunks if valid_chunks > 0 else torch.tensor(0.0).to(features.device)
+        # Iterate over all pairs of feature chunks
+        for i in range(self.num_max_views):
+            for j in range(i + 1, self.num_max_views):
+                # Compute the valid mask by logical AND operation between masks of the two views
+                valid_mask = split_masks[i].squeeze(1) & split_masks[j].squeeze(1)
+                
+                if valid_mask.any():
+                    # Select valid features for both views
+                    valid_features_i = split_features[i][valid_mask]
+                    valid_features_j = split_features[j][valid_mask]
+
+                    valid_features_i = valid_features_i.unsqueeze(1)
+                    valid_features_j = valid_features_j.unsqueeze(1)
+                    
+                    # Normalize features to get unit vectors
+                    features_norm_i = F.normalize(valid_features_i, p=2, dim=2)
+                    features_norm_j = F.normalize(valid_features_j, p=2, dim=2)
+                    
+                    # Compute similarities
+                    similarities = torch.bmm(features_norm_i, features_norm_j.transpose(1, 2)) / temperature
+                    
+                    # Create labels for the positive samples (diagonal elements in the batch)
+                    labels = torch.arange(valid_features_i.size(1), device=features.device)
+                    
+                    # Use log-softmax for numerical stability
+                    log_prob = F.log_softmax(similarities, dim=2)
+                    log_prob_positive = log_prob.gather(2, labels.view(1, -1).expand(valid_features_i.size(0), -1).unsqueeze(2)).squeeze(2)
+                    
+                    # Compute the mean of the log probabilities of the positive samples
+                    nce_loss = -log_prob_positive.mean()
+                    
+                    total_loss += nce_loss
+                    num_valid_pairs += 1
+        
+        # Average the loss across all valid pairs
+        final_loss = total_loss / num_valid_pairs if num_valid_pairs > 0 else torch.tensor(0.0).to(features.device)
         return final_loss
 
     def get_joint_feature(self, video_embed, video_padding_mask,
@@ -259,18 +271,18 @@ class ExoGroundingTransformer(nn.Module):
         It takes both visual and textual inputs."""
         video_embed = self.ln_video_init(self.video_pre_proj(video_embed))
         B,T,_,= video_embed.shape
-        #TODO: Fix below, positional emedding should only go up to seq_len, and be repeated for each view in video_embed
+        seq_len = T // self.num_max_views
         if interpolate_from:
             pos_embed_source = self.temporal_pos_embed[None, 0:interpolate_from, :]
             pos_embed = F.interpolate(pos_embed_source.transpose(1,2), 
-                size=T, mode='linear', align_corners=False).transpose(1,2)
+                size=seq_len, mode='linear', align_corners=False).transpose(1,2)
         else:
             if self.random_pos_start:
-                pos_start_idx = np.random.randint(0, int(T/2))
+                pos_start_idx = np.random.randint(0, int(seq_len/2))
             else:
                 pos_start_idx = 0
-            pos_embed = self.temporal_pos_embed[None, pos_start_idx:pos_start_idx+T, :]
-        
+            pos_embed = self.temporal_pos_embed[None, pos_start_idx:pos_start_idx+seq_len, :]
+        pos_embed = pos_embed.repeat(1, self.num_max_views, 1)
         video_embed_with_time = video_embed + self.ln_position_init(pos_embed)
         
         if audio_embed is not None:

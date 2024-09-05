@@ -118,7 +118,7 @@ def get_loss(input_data, logits, text_padding_mask, args):
         loss_dict['loss'] += loss_dict['Timestamp L1 loss']
     if args.use_distill_nce_loss and 'InfoNCE loss' in loss_dict.keys():
         loss_dict['loss'] += loss_dict['InfoNCE loss']
-    return loss_dict
+    return loss_dict, iou
 
 def visualize(input_data, logits, args, epoch):
     sentences = input_data['metadata']['narrations']

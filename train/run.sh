@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=ExoGround_ks_multi_train_400
+#SBATCH --job-name=ExoGround_ks_multi_egoexo_rand_narr_train
 #SBATCH --output=/checkpoint/%u/slurm_logs/exoground/train_%j.out
 #SBATCH --error=/checkpoint/%u/slurm_logs/exoground/train_%j.out
 #SBATCH --partition=learnfair
@@ -17,7 +17,7 @@ source activate sounding_narrations
 srun --label torchrun --nproc_per_node=8 \
     main_egoexo4d_distributed.py \
     --batch_size 16 \
-    --epochs 100 \
+    --epochs 700 \
     --num_workers 0 \
     --use_keysteps \
-    --views multi
+    --views all
