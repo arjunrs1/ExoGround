@@ -81,10 +81,10 @@ class ExoGroundingTransformer(nn.Module):
         
         # temporal positional encoding for video
         if self.pos_enc == 'learned':
-            self.temporal_pos_embed = nn.Parameter(torch.empty(1024, self.feature_dim)) #TODO: Get rid of hardcoded 1024
+            self.temporal_pos_embed = nn.Parameter(torch.empty(1024, self.feature_dim))
             nn.init.normal_(self.temporal_pos_embed, std=0.01)
         elif self.pos_enc == 'sine':
-            temporal_pos_embed = get_position_embedding_sine(self.feature_dim, 1024) #TODO: Get rid of hardcoded 1024
+            temporal_pos_embed = get_position_embedding_sine(self.feature_dim, 1024)
             self.register_buffer('temporal_pos_embed', temporal_pos_embed)
 
         # temporal positional encoding for text
@@ -166,7 +166,6 @@ class ExoGroundingTransformer(nn.Module):
             grounding = self.grounding_head(decoder_text_features)
         else:
             # Directly use text features from encoder output for grounding
-            #TODO: Need to modify grounding head in init in this case of not self.use_decoder, as it must take in a different feature size as input.
             grounding = self.grounding_head(text_features)
 
         output_dict = {'interval_preds': grounding}
@@ -174,6 +173,22 @@ class ExoGroundingTransformer(nn.Module):
             output_dict['distill_infonce_loss'] = distill_loss
 
         return output_dict
+
+    def add_positional_encoding(self, embed, interpolate_from=None):
+        B, T, _ = embed.shape
+        seq_len = T // self.num_max_views
+        if interpolate_from:
+            pos_embed_source = self.temporal_pos_embed[None, 0:interpolate_from, :]
+            pos_embed = F.interpolate(pos_embed_source.transpose(1, 2), size=seq_len, mode='linear', align_corners=False).transpose(1, 2)
+        else:
+            if self.random_pos_start:
+                pos_start_idx = np.random.randint(0, int(seq_len / 2))
+            else:
+                pos_start_idx = 0
+            pos_embed = self.temporal_pos_embed[None, pos_start_idx:pos_start_idx + seq_len, :]
+        pos_embed = pos_embed.repeat(1, self.num_max_views, 1)
+        embed_with_time = embed + self.ln_position_init(pos_embed)
+        return embed_with_time
 
     def compute_info_nce_loss(self, features, positive_features, temperature=0.1):
         """

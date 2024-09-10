@@ -28,10 +28,23 @@ from utils.train_utils import clip_gradients
 from utils.utils import AverageMeter, save_checkpoint, neq_load_customized, \
 calc_topk_accuracy, ProgressMeter, neq_load_customized, save_runtime_checkpoint, MovingAverage
 
-def get_phase(epoch, total_epochs, num_phases):
+def get_phase_old(epoch, total_epochs, num_phases):
     # Divide the total epochs by the number of phases to determine the length of each phase
     phase_length = total_epochs // num_phases
     current_phase = epoch // phase_length
+    return current_phase
+
+def get_phase(epoch, total_epochs, num_phases, final_phase_proportion):    
+    # Calculate the number of epochs for the final phase
+    final_phase_length = int(total_epochs * final_phase_proportion)
+    # Calculate the number of epochs for the other phases
+    other_phases_length = (total_epochs - final_phase_length) // (num_phases - 1)
+    # Determine the current phase
+    if epoch < (total_epochs - final_phase_length):
+        current_phase = epoch // other_phases_length
+    else:
+        current_phase = num_phases - 1  # the final phase
+    
     return current_phase
 
 def train(loader, model, optimizer, lr_scheduler, grad_scaler, device, epoch, args):
@@ -231,7 +244,6 @@ def evaluate(loader, model, device, epoch, args):
         if rank == 0 and (args.visualize and idx % args.vis_freq == 0 and not vis_this_epoch):
             visualize(input_data, logits, args, epoch)
             vis_this_epoch = True
-            #TODO: Put this on tensorboard, so you can visualize during training
 
     if rank == 0:
         print(f' * Loss {losses.avg:.4f}')
@@ -264,7 +276,7 @@ def setup(args):
         num_gpu = torch.cuda.device_count()
         args.num_gpu = num_gpu
         if args.rank == 0:
-            print('=> Effective BatchSize = %d' % args.batch_size) #TODO: Check whether this is right, or should be mult'd by num_gpu
+            print('=> Effective BatchSize = %d' % args.batch_size)
     else:
         args.num_gpu = 0
         device = torch.device('cpu')
@@ -578,7 +590,7 @@ def main(args):
         np.random.seed(epoch)
         random.seed(epoch)
         if args.views == "multi":
-            train_loader.dataset.set_phase(get_phase(epoch=epoch, total_epochs=args.epochs, num_phases=args.num_max_views))
+            train_loader.dataset.set_phase(get_phase(epoch=epoch, total_epochs=args.epochs, num_phases=args.num_max_views, final_phase_proportion=args.final_phase_prop))
         if args.distributed:
             dist.barrier()
         train_loss = train(train_loader, model, optimizer, lr_scheduler, grad_scaler, device, epoch, args)
@@ -650,6 +662,16 @@ train on exo views only: --views exo
 train on all views: --views all
 
 train on multi-views: --views multi
+
+multi-view with ego: --multi_view_egoexo
+
+pair-wise distill (all): --use_pairwise_distill_nce_loss
+
+pair-wise distill (unmasked views only): --pairwise_distill_mode unmasked
+
+narration order shuffling (train augmentation): --randomize_narration_order
+
+multi-view final phase fraction: --final_phase_prop <FRAC>
 
 resume training: --resume <PATH_TO_FILE>.tar
 """

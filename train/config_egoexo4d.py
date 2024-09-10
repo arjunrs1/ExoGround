@@ -62,6 +62,7 @@ def parse_args():
     parser.add_argument('--num_max_views', default=6, type=int) #6 for EgoExo4D
     parser.add_argument('--multi_view_egoexo', action='store_true', default=False)
     parser.add_argument('--randomize_narration_order', action='store_true', default=False)
+    parser.add_argument('--final_phase_prop', default=0.3, type=float)
 
     #data dimensions
     parser.add_argument('--video_feature_dim', default=4096, type=int)
