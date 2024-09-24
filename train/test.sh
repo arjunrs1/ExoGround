@@ -11,20 +11,41 @@
 #SBATCH --time=1:00:00
 #SBATCH --constraint=volta32gb
 
+if [ -z "$1" ]; then
+    echo "Error: No prefix name provided."
+    echo "Usage: sbatch $0 <prefix_name>"
+    exit 1
+fi
+
 ### init virtual environment if needed
 source activate sounding_narrations
 
+# srun --label torchrun --nproc_per_node=8 \
+#     main_egoexo4d_distributed.py \
+#     --batch_size 16 \
+#     --epochs 300 \
+#     --num_workers 0 \
+#     --use_keysteps \
+#     --views all \
+#     --exos random \
+#     --test /private/home/arjunrs1/exo_narration_grounding/ExoGround/train/log/2024_09_10_17_38_init_iou_l1_egoexo4d_len64_e6d6_pos-learned_textpos-0_policy-default_bs16_lr0.0001_audio=False_decoder=True_keysteps=True_view=all_meandur=True_distill=False_pair_ds=False_pair_ds_mode=all_multi_ego=False_narr_rand=False/model/model_best_epoch12.pth.tar \
+#     --name_prefix $1 \
+#     --visualize
+
 srun --label torchrun --nproc_per_node=8 \
     main_egoexo4d_distributed.py \
-    --batch_size 64 \
-    --epochs 1000 \
+    --batch_size 16 \
+    --epochs 100 \
     --num_workers 0 \
     --use_keysteps \
-    --views multi \
-    --multi_view_egoexo \
-    --use_pairwise_distill_nce_loss \
-    --test /private/home/arjunrs1/exo_narration_grounding/ExoGround/train/log/2024_09_08_00_06_init_iou_l1_egoexo4d_len64_e6d6_pos-learned_textpos-0_policy-default_bs64_lr0.0001_audio=False_decoder=True_keysteps=True_view=multi_meandur=True_distill=False_pair_ds=True_pair_ds_mode=all_multi_ego=True_narr_rand=False/model/model_best_epoch865.pth.tar \
-    --visualize
+    --views all \
+    --exos all \
+    --use_distill_nce_loss \
+    --test /private/home/arjunrs1/exo_narration_grounding/ExoGround/train/log/new_10_50_2024_09_23_04_21_init_iou_l1_egoexo4d_len64_e6d6_pos-learned_textpos-0_policy-default_bs16_lr0.0001_audio=False_decoder=True_keysteps=True_view=all_meandur=True_distill=True_pair_ds=False_pair_ds_mode=all_multi_ego=False_narr_rand=False/model/epoch99.pth.tar \
+    --visualize \
+    --name_prefix $1
+
+
 
 ### 0.1 final phase prop
 ### /private/home/arjunrs1/exo_narration_grounding/ExoGround/train/log/2024_09_07_23_52_init_iou_l1_egoexo4d_len64_e6d6_pos-learned_textpos-0_policy-default_bs64_lr0.0001_audio=False_decoder=True_keysteps=True_view=multi_meandur=True_distill=False_pair_ds=True_pair_ds_mode=all_multi_ego=True_narr_rand=False/model/model_best_epoch995.pth.tar

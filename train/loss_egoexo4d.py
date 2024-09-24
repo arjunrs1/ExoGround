@@ -105,10 +105,9 @@ def get_loss(input_data, logits, text_padding_mask, args):
     loss_dict['mean IoU'] = iou.mean()
     if args.use_distill_nce_loss and 'distill_infonce_loss' in logits.keys():
         loss_dict['InfoNCE loss'] = logits['distill_infonce_loss']
-    if args.test:
-        for theta in args.iou_thresholds:
-            iou_count = (iou > theta).sum().item()  / (~text_padding_mask).sum().item() #NOTE: We do mean, not sum, bc AverageMeter muls by n
-            loss_dict[f'IoU>={theta}'] = iou_count
+    for theta in args.iou_thresholds:
+        iou_count = (iou > theta).sum().item()  / (~text_padding_mask).sum().item() #NOTE: We do mean, not sum, bc AverageMeter muls by n
+        loss_dict[f'IoU>={theta}'] = iou_count
     # Combine losses into a single loss term:
     loss_dict['loss'] = loss_dict['IoU loss']
     if args.use_center_duration:

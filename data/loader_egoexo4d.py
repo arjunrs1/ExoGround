@@ -8,6 +8,8 @@ import json
 import ast
 import random
 import itertools
+from tqdm import tqdm
+import torch.nn.functional as F
 
 class EgoExo4DDataLoader(Dataset):
     def __init__(self,
@@ -23,6 +25,8 @@ class EgoExo4DDataLoader(Dataset):
                 multi_view_egoexo=False,
                 num_max_views=None,
                 randomize_narration_order=False,
+                curriculum_train=False,
+                exo_mode="all",
                 fps=30):
         self.split = split
         self.duration = duration
@@ -37,6 +41,8 @@ class EgoExo4DDataLoader(Dataset):
         self.multi_view_egoexo = multi_view_egoexo
         self.num_max_views = num_max_views
         self.randomize_narration_order = randomize_narration_order
+        self.curriculum_train = curriculum_train
+        self.exo_mode = exo_mode
         self.fps = fps
         self.base_path = '/private/home/arjunrs1/egoexo4d_features'
         self.vid_feat_rel_path = "checkpoint/yalesong/EgoExo4D_EgoVLPv2_arxivC/extracted_features_egovlp2/EgoVLPv2_Pretraining_bs512-lr3e_5-Ep20"
@@ -44,6 +50,13 @@ class EgoExo4DDataLoader(Dataset):
         self.annotation_path = f'/private/home/arjunrs1/exo_narration_grounding/data_processing/time_interval_annotation_files/narration_annotations/{split}.csv'
         self.keysteps_annotations_path = f'/private/home/arjunrs1/exo_narration_grounding/data_processing/time_interval_annotation_files/keystep_annotations/{split}.csv'
         self.takes_path = "/datasets01/egoexo4d/v2/takes/"
+        self.camera_pose_train_path = "/datasets01/egoexo4d/v2/annotations/ego_pose/train/camera_pose"
+        self.camera_pose_val_path = "/datasets01/egoexo4d/v2/annotations/ego_pose/val/camera_pose"
+        self.camera_pose_test_path = "/datasets01/egoexo4d/v2/annotations/ego_pose/test/camera_pose"
+        self.take_uid_cam_pose_split_map = {}
+        for camera_path in [self.camera_pose_train_path, self.camera_pose_val_path, self.camera_pose_test_path]:
+            for cam_file in os.listdir(camera_path):
+                self.take_uid_cam_pose_split_map[cam_file.split(".")[0]] = camera_path.split("/")[-2]
 
         self.atomic_take_cam_map_train_path = f'/datasets01/egoexo4d/v2/annotations/atomic_descriptions_train.json'
         self.atomic_take_cam_map_test_path = f'/datasets01/egoexo4d/v2/annotations/atomic_descriptions_val.json'
@@ -55,6 +68,12 @@ class EgoExo4DDataLoader(Dataset):
             self.atomic_take_cam_map_test = json.load(f)['take_cam_id_map']
 
         assert not ((self.views == "ego") and (self.use_distill_nce_loss)) #We cannot train on ego only and distill from ego view simultaneously
+
+        if self.curriculum_train:
+            assert self.exo_mode == "all" # curriculum training only on all views (not best, worst, random)
+            assert self.split == "train"
+        if self.split != "train":
+            assert self.exo_mode == "all" # for val/testing, ensure we are using all views
 
         if self.use_keysteps:
             self.annotations = pd.read_csv(self.keysteps_annotations_path)
@@ -72,8 +91,16 @@ class EgoExo4DDataLoader(Dataset):
             else:
                 self.view_map = {"cam01": 0, "gp01": 0, "cam02": 1, "gp02":1, "cam03": 2, "gp03": 2, "cam04": 3, "gp04": 3, "cam05": 4, "gp05": 4, "gp06": 5}
         self.current_phase = 0
-        self.window_csv_path = os.path.join(self.base_path, f'{split}_{views}_ks={use_keysteps}_windows.csv')
+        self.window_csv_path = os.path.join(self.base_path, f'{split}_{views}_ks={use_keysteps}_ct={curriculum_train}_exos={exo_mode}_windows.csv')
+        self.windows_cam_distances_path = os.path.join(self.base_path, f'{split}_{views}_ks={use_keysteps}_ct={curriculum_train}_cam_dists.csv')
         self.precompute_windows()
+        if self.curriculum_train:
+            assert ((self.split == "train") and (self.views == "all"))
+            self.cam_distances = pd.read_csv(self.windows_cam_distances_path)
+            self.windows['cam_ego_distance'] = self.cam_distances['cam_ego_distance']
+            self.windows.sort_values(by='cam_ego_distance', inplace=True)
+            self.windows.to_csv("/private/home/arjunrs1/egoexo4d_features/sorted.csv", index=False)
+            self.windows.drop(columns=['cam_ego_distance'], inplace=True)
 
     def __len__(self):
         return len(self.windows)
@@ -95,11 +122,81 @@ class EgoExo4DDataLoader(Dataset):
     def set_phase(self, phase):
         self.current_phase = phase
 
+    def camera_view_order(self, take_uid, cam_list, start_sec, end_sec, full_ego_cam_name, ego_cam_ray_point=0.7):
+        try:
+            take_cam_path = f"/datasets01/egoexo4d/v2/annotations/ego_pose/{self.take_uid_cam_pose_split_map[take_uid]}/camera_pose"
+            with open(os.path.join(take_cam_path, f"{take_uid}.json"), "rb") as f:
+                camera_data = json.load(f)
+        except:
+            print(f"Could not find camera parameters for {take_uid}")
+            assert full_ego_cam_name in cam_list
+            cam_list.remove(full_ego_cam_name)
+            cam_list.insert(0, full_ego_cam_name)
+            sorted_dict = {c: cam_list.index(c) for c in cam_list}
+            return cam_list[::-1], sorted_dict
+
+        cam_positions = []
+        all_cam_labels = []
+        rotations = []
+        frame_idx = int((start_sec + ((end_sec - start_sec) / 2)) * self.fps) #use average frame index in window
+        ego_cam = None
+        for cam, details in camera_data.items():
+            try:
+                if cam.lower().startswith("aria"):
+                    extrinsic = np.array(details['camera_extrinsics'][f"{frame_idx}"])
+                    ego_cam = cam
+                elif (cam.lower().startswith("cam") or cam.lower().startswith("gp")):
+                    extrinsic = np.array(details['camera_extrinsics'])
+                else:
+                    #metadata key should be ignored
+                    continue
+            except:
+                print(f"Could not get parameters for {cam} with take uid {take_uid}")
+                continue
+            extrinsic = np.linalg.inv(np.vstack([extrinsic, [0, 0, 0, 1]]))[:3,:]
+            translation = extrinsic[:, -1]
+            rotation = extrinsic[:, :3]
+
+            cam_positions.append(translation)
+            all_cam_labels.append(cam)
+            rotations.append(rotation)
+
+        cam_positions = np.array(cam_positions)
+        rotations = np.array(rotations)
+        ego_index = all_cam_labels.index(ego_cam)
+
+        # Compute the vector between that point and all the exocentric camera positions
+        point_X_meters = cam_positions[ego_index] + ego_cam_ray_point * np.dot(rotations[ego_index], [0,0,1])
+        vectors_to_exo_cams = point_X_meters - cam_positions
+        orientation_vectors = np.dot(rotations, [0,0,1])
+        # Compute the cosine similarity between each exocentric camera's orientation vector and its vector computed in step (2)
+        cosine_similarities = np.array(F.cosine_similarity(torch.tensor(orientation_vectors), torch.tensor(vectors_to_exo_cams)))
+        # Compute the x-y cosine similarity between each exo camera's viewing orientation and the ego camera's viewing orientation to determine ones in front or behind
+        x_y_cosine_similarities = np.dot(orientation_vectors[:, :2], orientation_vectors[ego_index, :2]) / (
+            np.linalg.norm(orientation_vectors[:, :2], axis=1) * np.linalg.norm(orientation_vectors[ego_index, :2]))
+        # Split the x_y_cosine similarities into negative and positive groups
+        negative_group = np.where(x_y_cosine_similarities > 0)[0]
+        positive_group = np.where(x_y_cosine_similarities <= 0)[0]
+        # Use the cosine_similarity array to further sort within each group
+        negative_group_final = np.argsort(cosine_similarities[negative_group])[::-1]
+        positive_group_final = np.argsort(cosine_similarities[positive_group])[::-1]
+        # Combine the two sorted lists
+        combined_list = np.concatenate((positive_group[positive_group_final], negative_group[negative_group_final]))
+        
+        sorted_cams = list(np.take(all_cam_labels, combined_list))
+        sorted_cams.remove(ego_cam)
+        sorted_cams.insert(0,full_ego_cam_name)
+        cam_distances = {c: sorted_cams.index(c) for c in sorted_cams}
+        sorted_cams = sorted_cams[::-1]
+        return sorted_cams, cam_distances
+
     def precompute_windows(self):
         if not os.path.exists(self.window_csv_path):
             print("Computing windows...")
             windows = []
-            for _, row in self.split_data.iterrows():
+            if self.split == "train" and self.views == "all":
+                cam_dists = []
+            for _, row in tqdm(self.split_data.iterrows(), total=len(self.split_data)):
                 video_id = row['take_name']
                 take_uid = row['take_uid']
                 duration_sec = int(row['duration_sec'])
@@ -119,13 +216,28 @@ class EgoExo4DDataLoader(Dataset):
                     if len(narrations) != 0:
                         if self.multi_view:
                             windows.append([video_id, cams if self.multi_view_egoexo else exo_cams, ego_cam, start_sec, end_sec, ','.join(narration_ids)])
-                        else:
-                            for cam1, cam2 in list(itertools.permutations(cams, 2)):
-                                windows.append([video_id, cam1, cam2, start_sec, end_sec, ','.join(narration_ids)])
+                        else: #all view
+                            if self.split == "train":
+                                sorted_cams, cam_distances = self.camera_view_order(take_uid, cams, start_sec, end_sec, ego_cam)
+                                far_close_pairs = list(itertools.combinations(sorted_cams, 2))
+                                for cam1, cam2 in far_close_pairs:
+                                    windows.append([video_id, cam1, cam2, start_sec, end_sec, ','.join(narration_ids)])
+                                    cam_dists.append(cam_distances[cam1])
+                                if ego_cam in cams:
+                                    windows.append([video_id, ego_cam, ego_cam, start_sec, end_sec, ','.join(narration_ids)])
+                                    cam_dists.append(0)
+                            else: 
+                                #for val/test set, we should only include each view once (and only exos)
+                                for camera in exo_cams:
+                                    windows.append([video_id, camera, camera, start_sec, end_sec, ','.join(narration_ids)])
+                                     
             columns = ['video_id', 'exo_cam', 'ego_cam', 'start_sec', 'end_sec', 'narration_ids']
             windows_df = pd.DataFrame(windows, columns=columns)
             windows_df.to_csv(self.window_csv_path, index=False)
             self.windows = windows_df
+            if self.curriculum_train:
+                cam_distances_df = pd.DataFrame(cam_dists, columns=["cam_ego_distance"])
+                cam_distances_df.to_csv(self.windows_cam_distances_path, index=False)
         else:
             print("Loading windows...")
             self.windows = pd.read_csv(self.window_csv_path)

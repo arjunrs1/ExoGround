@@ -28,6 +28,55 @@ from utils.train_utils import clip_gradients
 from utils.utils import AverageMeter, save_checkpoint, neq_load_customized, \
 calc_topk_accuracy, ProgressMeter, neq_load_customized, save_runtime_checkpoint, MovingAverage
 
+class CurriculumDistributedSampler(DistributedSampler):
+    def __init__(self, dataset, num_replicas=None, rank=None, shuffle=True, seed=0, curriculum_epoch=0, max_epochs=None, start_frac=0.25, end_epoch_frac=0.75):
+        super().__init__(dataset, num_replicas=num_replicas, rank=rank, shuffle=False, seed=seed)
+        self.shuffle = shuffle
+        self.curriculum_epoch = curriculum_epoch
+        self.max_epochs = max_epochs
+        self.start_frac = start_frac
+        self.end_epoch_frac = end_epoch_frac
+
+    def __iter__(self):
+        # Calculate the curriculum progress
+        curriculum_progress = max(self.start_frac, min(1.0, self.start_frac + (self.curriculum_epoch / (self.max_epochs * self.end_epoch_frac)) * self.end_epoch_frac))
+        num_samples = int(curriculum_progress * len(self.dataset))
+        indices = list(range(len(self.dataset)))
+
+        # Select the first num_samples based on the curriculum progress
+        indices = indices[:num_samples]
+
+        # Shuffle if required
+        if self.shuffle:
+            g = torch.Generator()
+            g.manual_seed(self.seed + self.epoch)
+            indices = torch.tensor(indices).tolist()
+            indices = torch.randperm(len(indices), generator=g).tolist()
+
+        if not self.drop_last:
+            # add extra samples to make it evenly divisible
+            padding_size = self.total_size - len(indices)
+            if padding_size <= len(indices):
+                indices += indices[:padding_size]
+            else:
+                indices += (indices * math.ceil(padding_size / len(indices)))[
+                    :padding_size
+                ]
+        else:
+            # remove tail of data to make it evenly divisible.
+            indices = indices[: self.total_size]
+        assert len(indices) == self.total_size
+
+        # Subsample
+        indices = indices[self.rank:self.total_size:self.num_replicas]
+        assert len(indices) == self.num_samples
+
+        return iter(indices)
+
+    def set_epoch(self, epoch):
+        super().set_epoch(epoch)
+        self.curriculum_epoch = epoch
+
 def get_phase_old(epoch, total_epochs, num_phases):
     # Divide the total epochs by the number of phases to determine the length of each phase
     phase_length = total_epochs // num_phases
@@ -132,7 +181,8 @@ def train(loader, model, optimizer, lr_scheduler, grad_scaler, device, epoch, ar
         # log stats
         if rank == 0 and args.iteration % 5 == 0:
             for k, v in loss_dict.items():
-                args.train_plotter.add_data(f'train/{k}', v.item(), args.iteration)
+                value = v if k.startswith('IoU>=') else v.item()
+                args.train_plotter.add_data(f'train/{k}', value, args.iteration)
             args.train_plotter.add_data('train/lr', lr_scheduler.get_last_lr()[0], args.iteration)
             args.train_plotter.add_data('device/sps', 1/(time.time()-end), args.iteration)
             args.train_plotter.log_gpustat(step=args.iteration)
@@ -172,14 +222,11 @@ def evaluate(loader, model, device, epoch, args):
     rank = args.rank
     model.eval()
     batch_time = AverageMeter('Time', ':.2f')
+    metric_meters = {} # Dictionary to hold AverageMeters for each metric
     losses = AverageMeter('Loss', ':.4f')
-    if args.test:
-        iou_threshold_meters = {}
-        for theta in args.iou_thresholds:
-            iou_threshold_meters[f"{theta}"] = AverageMeter(f'IoU>={theta}', ':.4f')
     progress = ProgressMeter(
         len(loader), [batch_time, losses],
-        prefix="Test: ")
+        prefix="Test: " if args.test else "Val: ")
 
     end = time.time()
     vis_this_epoch = False
@@ -218,12 +265,24 @@ def evaluate(loader, model, device, epoch, args):
                                  text_padding_mask=text_padding_mask,
                                  logits=logits, 
                                  args=args)
+    
+        # Update IoU threshold metrics
+        for theta in args.iou_thresholds:
+            key = f'IoU>={theta}'
+            if key in loss_dict:
+                if key not in metric_meters:
+                    metric_meters[key] = AverageMeter(key, ':.4f')
+                metric_meters[key].update(loss_dict[key], int(text_padding_mask.sum()))
+
+        # Update other metrics
+        for key, value in loss_dict.items():
+            if not key.startswith('IoU>='):
+                if key not in metric_meters:
+                    metric_meters[key] = AverageMeter(key, ':.4f')
+                metric_meters[key].update(value.item(), video_seq.size(0))
 
         loss = loss_dict['loss']
         losses.update(loss.item(), video_seq.size(0))
-        if args.test:
-            for theta in args.iou_thresholds:
-                iou_threshold_meters[f"{theta}"].update(loss_dict[f'IoU>={theta}'], int(text_padding_mask.sum()))
 
         # Measure elapsed time
         batch_time.update(time.time() - end)
@@ -247,16 +306,16 @@ def evaluate(loader, model, device, epoch, args):
 
     if rank == 0:
         print(f' * Loss {losses.avg:.4f}')
-        for k, v in loss_dict.items():
-            if "IoU>=" not in k:
-                args.train_plotter.add_data(f'val/{k}', v.item(), epoch)
+        # Log all average values to TensorBoard
+        for key, meter in metric_meters.items():
+            args.train_plotter.add_data(f'val/{key}', meter.avg, epoch)
         
         if args.test:
             with open(os.path.join(args.log_path, f'test_results_epoch_{epoch}.json'), 'w') as f:
                 json.dump(save_list, f)
     
     if args.test:
-        return losses.avg, iou_threshold_meters
+        return losses.avg, metric_meters
     else:
         return losses.avg
 
@@ -308,7 +367,9 @@ def get_dataset(args):
         use_center_duration=args.use_center_duration,
         multi_view_egoexo=args.multi_view_egoexo,
         num_max_views=args.num_max_views,
-        randomize_narration_order=args.randomize_narration_order)
+        randomize_narration_order=args.randomize_narration_order,
+        curriculum_train=args.curriculum_train,
+        exo_mode=args.exos)
     val_dataset = D(
         split="val",
         duration=args.seq_len,
@@ -323,7 +384,10 @@ def get_dataset(args):
         num_max_views=args.num_max_views,
         randomize_narration_order=False)
 
-    train_sampler = DistributedSampler(train_dataset, num_replicas=args.world_size, rank=args.rank)
+    if args.views == "all" and args.curriculum_train:
+        train_sampler = CurriculumDistributedSampler(train_dataset, num_replicas=args.world_size, rank=args.rank, max_epochs=args.epochs, start_frac=args.start_frac, end_epoch_frac=args.end_epoch_frac)
+    else:
+        train_sampler = DistributedSampler(train_dataset, num_replicas=args.world_size, rank=args.rank)
     val_sampler = DistributedSampler(val_dataset, num_replicas=args.world_size, rank=args.rank)
 
     print("Loading train dataset...")
@@ -339,7 +403,7 @@ def get_dataset(args):
         collate_fn=val_dataset.collate_fn, pin_memory=True, drop_last=True, #TODO: Eventually revert this to drop_last=False, there was an issue with last batch that was causing issues
         shuffle=(val_sampler is None), sampler=val_sampler, 
     )
-    return train_dataset, val_dataset, train_loader, val_loader
+    return train_dataset, val_dataset, train_loader, val_loader, train_sampler
 
 def get_test_dataset(args):
     D = EgoExo4DDataLoader
@@ -413,6 +477,9 @@ def main(args):
     assert args.pairwise_distill_mode in ["all", "unmasked"]
     assert args.views in ["exo", "ego", "all", "multi"]
 
+    if args.exos != "all":
+        assert not args.use_distill_nce_loss #We shouldn't be distilling for the exos experiments
+
     #ensure we are only including ego view in multi-view training if we are doing multi-view training
     if args.multi_view_egoexo:
         assert args.views == "multi"
@@ -422,7 +489,7 @@ def main(args):
         args.num_max_views +=1 
 
     if not args.test:
-        _, _, train_loader, val_loader = get_dataset(args)
+        _, _, train_loader, val_loader, train_sampler = get_dataset(args)
 
     if args.test:
         #ensure no overlapping segments for full video inference
@@ -500,19 +567,21 @@ def main(args):
 
         if rank == 0:
             print('Start Inference ...')
-        _, iou_metric_meters = evaluate(test_loader, model, device, epoch, args)
+        _, all_metric_meters = evaluate(test_loader, model, device, epoch, args)
         if rank == 0:
             mean_iou = []
-            for k, v in iou_metric_meters.items():
-                print(f"IoU>={k}: {v.avg:.4f}")
-                mean_iou.append(v.avg)
+            for theta in args.iou_thresholds:
+                theta_threshold_name = f'IoU>={theta}'
+                theta_threshold_value = all_metric_meters[theta_threshold_name].avg
+                print(f"{theta_threshold_name}: {theta_threshold_value:.4f}")
+                mean_iou.append(theta_threshold_value)
             print(f"Mean IoU: {np.array(mean_iou).mean():.4f}")
 
         dist.barrier()
         sys.exit(0)
 
     ### restart ###
-    best_acc = 1e5 
+    best_val_loss = 1e5 
     if args.resume:
         print(f"resume from checkpoint {args.resume}")
         args.resume = get_model_card(args.resume)
@@ -520,7 +589,7 @@ def main(args):
         state_dict = checkpoint['state_dict']
         args.start_epoch = checkpoint['epoch']+1
         args.iteration = checkpoint['iteration']
-        best_acc = checkpoint['best_acc']
+        best_val_loss = checkpoint['best_acc']
         try:
             model_without_dp.load_state_dict(state_dict)
         except:
@@ -591,6 +660,8 @@ def main(args):
         random.seed(epoch)
         if args.views == "multi":
             train_loader.dataset.set_phase(get_phase(epoch=epoch, total_epochs=args.epochs, num_phases=args.num_max_views, final_phase_proportion=args.final_phase_prop))
+        elif args.views == "all" and args.curriculum_train:
+            train_sampler.set_epoch(epoch)
         if args.distributed:
             dist.barrier()
         train_loss = train(train_loader, model, optimizer, lr_scheduler, grad_scaler, device, epoch, args)
@@ -599,15 +670,15 @@ def main(args):
         #moving_average.update(val_loss)
         #smoothed_val_loss = moving_average.average()
         if rank == 0 and ((epoch % args.eval_freq == 0) or (epoch == args.epochs - 1)):
-            is_best = val_loss < best_acc  #use val loss to determine is_best
+            is_best = val_loss < best_val_loss  #use val loss to determine is_best
             #is_best = smoothed_val_loss < best_val_loss (REPLACE ABOVE LINE WITH THIS IF USING MOVING AVERAGE)
             #if is_best:
-            best_acc = min(val_loss, best_acc)
+            best_val_loss = min(val_loss, best_val_loss)
             state_dict = model_without_dp.state_dict()
             save_dict = {
                 'epoch': epoch,
                 'state_dict': state_dict,
-                'best_acc': best_acc,
+                'best_acc': best_val_loss,
                 'optimizer': optimizer.state_dict(),
                 'iteration': args.iteration}
             save_checkpoint(save_dict, is_best, args.eval_freq, 
@@ -672,6 +743,14 @@ pair-wise distill (unmasked views only): --pairwise_distill_mode unmasked
 narration order shuffling (train augmentation): --randomize_narration_order
 
 multi-view final phase fraction: --final_phase_prop <FRAC>
+
+curriculum train: --curriculum_train
+
+exos (for training): --exos best, random, worst, all(default)
+
+curr learning start fraction: --start_frac <FRAC>
+
+curr learning end epoch perc. of max epochs: --end_epoch_frac <FRAC>
 
 resume training: --resume <PATH_TO_FILE>.tar
 """

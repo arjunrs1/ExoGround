@@ -63,6 +63,10 @@ def parse_args():
     parser.add_argument('--multi_view_egoexo', action='store_true', default=False)
     parser.add_argument('--randomize_narration_order', action='store_true', default=False)
     parser.add_argument('--final_phase_prop', default=0.3, type=float)
+    parser.add_argument('--curriculum_train', action='store_true', default=False)
+    parser.add_argument('--exos', default='all', type=str) #options: 'all', 'best', 'random', 'worst'
+    parser.add_argument('--start_frac', default=0.25, type=float) #percentage of initial data for training (curriculum learning)
+    parser.add_argument('--end_epoch_frac', default=0.75, type=float) #percentage of max_epochs by which we should be training on all data (curriculum learning)
 
     #data dimensions
     parser.add_argument('--video_feature_dim', default=4096, type=int)
