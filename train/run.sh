@@ -29,9 +29,7 @@ srun --label torchrun --nproc_per_node=8 \
     --views all \
     --exos all \
     --use_distill_nce_loss \
-    --curriculum_train \
-    --start_frac 0.3 \
-    --end_epoch_frac 0.5 \
+    --stitched_best_exo_distill \
     --name_prefix $1
 
 ### --use_distill_nce_loss \

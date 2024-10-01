@@ -26,6 +26,7 @@ class EgoExo4DDataLoader(Dataset):
                 num_max_views=None,
                 randomize_narration_order=False,
                 curriculum_train=False,
+                stitched_best_exo_distill=False,
                 exo_mode="all",
                 fps=30):
         self.split = split
@@ -42,6 +43,7 @@ class EgoExo4DDataLoader(Dataset):
         self.num_max_views = num_max_views
         self.randomize_narration_order = randomize_narration_order
         self.curriculum_train = curriculum_train
+        self.stitched_best_exo_distill = stitched_best_exo_distill
         self.exo_mode = exo_mode
         self.fps = fps
         self.base_path = '/private/home/arjunrs1/egoexo4d_features'
@@ -62,7 +64,9 @@ class EgoExo4DDataLoader(Dataset):
         self.atomic_take_cam_map_test_path = f'/datasets01/egoexo4d/v2/annotations/atomic_descriptions_val.json'
 
         with open(self.atomic_take_cam_map_train_path, "rb") as f:
-            self.atomic_take_cam_map_train = json.load(f)['take_cam_id_map']
+            atomic_descriptions_train_data = json.load(f)
+            self.atomic_take_cam_map_train = atomic_descriptions_train_data['take_cam_id_map']
+            self.atomic_descriptions_train = atomic_descriptions_train_data['annotations']
 
         with open(self.atomic_take_cam_map_test_path, "rb") as f:
             self.atomic_take_cam_map_test = json.load(f)['take_cam_id_map']
@@ -220,9 +224,14 @@ class EgoExo4DDataLoader(Dataset):
                             if self.split == "train":
                                 sorted_cams, cam_distances = self.camera_view_order(take_uid, cams, start_sec, end_sec, ego_cam)
                                 far_close_pairs = list(itertools.combinations(sorted_cams, 2))
-                                for cam1, cam2 in far_close_pairs:
-                                    windows.append([video_id, cam1, cam2, start_sec, end_sec, ','.join(narration_ids)])
-                                    cam_dists.append(cam_distances[cam1])
+                                if self.stitched_best_exo_distill:
+                                    for cam1 in sorted_cams:
+                                        windows.append([video_id, cam1, ego_cam, start_sec, end_sec, ','.join(narration_ids)])
+                                        cam_dists.append(cam_distances[cam1])
+                                else:
+                                    for cam1, cam2 in far_close_pairs:
+                                        windows.append([video_id, cam1, cam2, start_sec, end_sec, ','.join(narration_ids)])
+                                        cam_dists.append(cam_distances[cam1])
                                 if ego_cam in cams:
                                     windows.append([video_id, ego_cam, ego_cam, start_sec, end_sec, ','.join(narration_ids)])
                                     cam_dists.append(0)
@@ -283,6 +292,36 @@ class EgoExo4DDataLoader(Dataset):
             mask[start_idx:end_idx] = True
         return mask
 
+    def get_distill_video_features(self, video_id, ego_cam, take_ego_id, start_sec, end_sec):
+        #TODO: Speed this up -> Cache the rankings?
+        distill_feature_views = [ego_cam for _ in range(self.duration)]
+        # Load default video features for the specified duration
+        default_features_path = os.path.join(self.video_feature_path, f"{take_ego_id}.pt")
+        try:
+            default_features = torch.load(default_features_path)[start_sec:end_sec]
+        except Exception as e:
+            print(f"Error loading default features from {default_features_path}: {e}")
+            return None
+        stitched_features = default_features.clone()
+        take_uid = self.split_data[self.split_data['take_name'] == video_id]['take_uid'].iloc[0]
+        atomic_narrations = self.atomic_descriptions_train.get(str(take_uid), [])
+        if atomic_narrations:
+            descriptions = atomic_narrations[0].get('descriptions', [])
+            for narr in descriptions:
+                try:
+                    timestamp = int(round(narr['timestamp']))
+                    if start_sec <= timestamp < end_sec:
+                        feat_idx = timestamp - start_sec
+                        best_exo = narr['best_exo']['cam_id']
+                        take_exo_id = f"{video_id}_{best_exo}"
+                        exo_features_path = os.path.join(self.video_feature_path, f"{take_exo_id}.pt")
+                        exo_features = torch.load(exo_features_path)
+                        stitched_features[feat_idx] = exo_features[timestamp]
+                        distill_feature_views[feat_idx] = best_exo
+                except Exception as e:
+                    pass
+        return stitched_features
+
     def __getitem__(self, idx):
         window = self.windows.iloc[idx]
         video_id, exo_cams, ego_cam, start_sec, end_sec = window['video_id'], window['exo_cam'], window['ego_cam'], window['start_sec'], window['end_sec']
@@ -323,7 +362,10 @@ class EgoExo4DDataLoader(Dataset):
             
 
         if self.use_distill_nce_loss:
-            ego_video_features = torch.load(os.path.join(self.video_feature_path, f"{take_ego_id}.pt"))[start_sec:end_sec]
+            if self.stitched_best_exo_distill:
+                ego_video_features = self.get_distill_video_features(video_id, ego_cam, take_ego_id, start_sec, end_sec)
+            else:
+                ego_video_features = torch.load(os.path.join(self.video_feature_path, f"{take_ego_id}.pt"))[start_sec:end_sec]
         
         #Load audio features if used
         if self.use_audio:

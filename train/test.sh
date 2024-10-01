@@ -41,9 +41,13 @@ srun --label torchrun --nproc_per_node=8 \
     --views all \
     --exos all \
     --use_distill_nce_loss \
-    --test /private/home/arjunrs1/exo_narration_grounding/ExoGround/train/log/new_10_50_2024_09_23_04_21_init_iou_l1_egoexo4d_len64_e6d6_pos-learned_textpos-0_policy-default_bs16_lr0.0001_audio=False_decoder=True_keysteps=True_view=all_meandur=True_distill=True_pair_ds=False_pair_ds_mode=all_multi_ego=False_narr_rand=False/model/epoch99.pth.tar \
+    --curriculum_train \
+    --test /private/home/arjunrs1/exo_narration_grounding/ExoGround/train/log/stitch_curr_2024_09_25_19_07_init_iou_l1_egoexo4d_len64_e6d6_pos-learned_textpos-0_policy-default_bs16_lr0.0001_audio=False_decoder=True_keysteps=True_view=all_meandur=True_distill=True_pair_ds=False_pair_ds_mode=all_multi_ego=False_narr_rand=False/model/epoch38.pth.tar \
     --visualize \
     --name_prefix $1
+
+### --use_distill_nce_loss \
+### --curriculum_train \
 
 
 

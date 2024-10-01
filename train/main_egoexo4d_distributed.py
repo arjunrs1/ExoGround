@@ -369,6 +369,7 @@ def get_dataset(args):
         num_max_views=args.num_max_views,
         randomize_narration_order=args.randomize_narration_order,
         curriculum_train=args.curriculum_train,
+        stitched_best_exo_distill=args.stitched_best_exo_distill,
         exo_mode=args.exos)
     val_dataset = D(
         split="val",
@@ -751,6 +752,8 @@ exos (for training): --exos best, random, worst, all(default)
 curr learning start fraction: --start_frac <FRAC>
 
 curr learning end epoch perc. of max epochs: --end_epoch_frac <FRAC>
+
+whether to train with stitched-view best exo distillation: --stitched_best_exo_distill
 
 resume training: --resume <PATH_TO_FILE>.tar
 """
