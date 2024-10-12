@@ -27,6 +27,7 @@ class EgoExo4DDataLoader(Dataset):
                 randomize_narration_order=False,
                 curriculum_train=False,
                 stitched_best_exo_distill=False,
+                model="grounding",
                 exo_mode="all",
                 fps=30):
         self.split = split
@@ -44,6 +45,7 @@ class EgoExo4DDataLoader(Dataset):
         self.randomize_narration_order = randomize_narration_order
         self.curriculum_train = curriculum_train
         self.stitched_best_exo_distill = stitched_best_exo_distill
+        self.model = model
         self.exo_mode = exo_mode
         self.fps = fps
         self.base_path = '/private/home/arjunrs1/egoexo4d_features'
@@ -55,6 +57,9 @@ class EgoExo4DDataLoader(Dataset):
         self.camera_pose_train_path = "/datasets01/egoexo4d/v2/annotations/ego_pose/train/camera_pose"
         self.camera_pose_val_path = "/datasets01/egoexo4d/v2/annotations/ego_pose/val/camera_pose"
         self.camera_pose_test_path = "/datasets01/egoexo4d/v2/annotations/ego_pose/test/camera_pose"
+        self.camera_rankings_path = os.path.join(self.base_path, "camera_rankings.json")
+        self.best_exo_annotations_path = os.path.join(self.base_path, "best_exo_annotations.json")
+
         self.take_uid_cam_pose_split_map = {}
         for camera_path in [self.camera_pose_train_path, self.camera_pose_val_path, self.camera_pose_test_path]:
             for cam_file in os.listdir(camera_path):
@@ -70,6 +75,12 @@ class EgoExo4DDataLoader(Dataset):
 
         with open(self.atomic_take_cam_map_test_path, "rb") as f:
             self.atomic_take_cam_map_test = json.load(f)['take_cam_id_map']
+
+        with open(self.camera_rankings_path, "rb") as f:
+            self.camera_rankings = json.load(f)
+
+        with open(self.best_exo_annotations_path, "rb") as f:
+            self.best_exo_annotations = json.load(f)
 
         assert not ((self.views == "ego") and (self.use_distill_nce_loss)) #We cannot train on ego only and distill from ego view simultaneously
 
@@ -95,11 +106,14 @@ class EgoExo4DDataLoader(Dataset):
             else:
                 self.view_map = {"cam01": 0, "gp01": 0, "cam02": 1, "gp02":1, "cam03": 2, "gp03": 2, "cam04": 3, "gp04": 3, "cam05": 4, "gp05": 4, "gp06": 5}
         self.current_phase = 0
-        self.window_csv_path = os.path.join(self.base_path, f'{split}_{views}_ks={use_keysteps}_ct={curriculum_train}_exos={exo_mode}_windows.csv')
-        self.windows_cam_distances_path = os.path.join(self.base_path, f'{split}_{views}_ks={use_keysteps}_ct={curriculum_train}_cam_dists.csv')
+        if split != "train":
+            self.window_csv_path = os.path.join(self.base_path, f'{model}_{split}_{views}_ks={use_keysteps}_ct={curriculum_train}_exos={exo_mode}_windows.csv')
+            self.windows_cam_distances_path = os.path.join(self.base_path, f'{model}_{split}_{views}_ks={use_keysteps}_ct={curriculum_train}_cam_dists.csv')
+        else:
+            self.window_csv_path = os.path.join(self.base_path, f'{split}_{views}_ks={use_keysteps}_ct={curriculum_train}_exos={exo_mode}_windows.csv')
+            self.windows_cam_distances_path = os.path.join(self.base_path, f'{split}_{views}_ks={use_keysteps}_ct={curriculum_train}_cam_dists.csv')
         self.precompute_windows()
-        if self.curriculum_train:
-            assert ((self.split == "train") and (self.views == "all"))
+        if (self.curriculum_train) or (self.model == "view_invariant" and self.split != "train"):
             self.cam_distances = pd.read_csv(self.windows_cam_distances_path)
             self.windows['cam_ego_distance'] = self.cam_distances['cam_ego_distance']
             self.windows.sort_values(by='cam_ego_distance', inplace=True)
@@ -198,7 +212,7 @@ class EgoExo4DDataLoader(Dataset):
         if not os.path.exists(self.window_csv_path):
             print("Computing windows...")
             windows = []
-            if self.split == "train" and self.views == "all":
+            if (self.split == "train" and self.views == "all") or (self.model == "view_invariant"):
                 cam_dists = []
             for _, row in tqdm(self.split_data.iterrows(), total=len(self.split_data)):
                 video_id = row['take_name']
@@ -221,17 +235,16 @@ class EgoExo4DDataLoader(Dataset):
                         if self.multi_view:
                             windows.append([video_id, cams if self.multi_view_egoexo else exo_cams, ego_cam, start_sec, end_sec, ','.join(narration_ids)])
                         else: #all view
-                            if self.split == "train":
+                            if (self.split == "train") or (self.model == "view_invariant"):
                                 sorted_cams, cam_distances = self.camera_view_order(take_uid, cams, start_sec, end_sec, ego_cam)
+                                #TODO: Should we change this so that we are including all views once, with ego as the distill?
+                                #Then, we would just control what is distilled via get_ego_features in get_item
+                                #This involves using the annotations we computed in view_ranking 
+                                #Always distill better view into worse view
                                 far_close_pairs = list(itertools.combinations(sorted_cams, 2))
-                                if self.stitched_best_exo_distill:
-                                    for cam1 in sorted_cams:
-                                        windows.append([video_id, cam1, ego_cam, start_sec, end_sec, ','.join(narration_ids)])
-                                        cam_dists.append(cam_distances[cam1])
-                                else:
-                                    for cam1, cam2 in far_close_pairs:
-                                        windows.append([video_id, cam1, cam2, start_sec, end_sec, ','.join(narration_ids)])
-                                        cam_dists.append(cam_distances[cam1])
+                                for cam1, cam2 in far_close_pairs:
+                                    windows.append([video_id, cam1, cam2, start_sec, end_sec, ','.join(narration_ids)])
+                                    cam_dists.append(cam_distances[cam1])
                                 if ego_cam in cams:
                                     windows.append([video_id, ego_cam, ego_cam, start_sec, end_sec, ','.join(narration_ids)])
                                     cam_dists.append(0)
@@ -244,7 +257,7 @@ class EgoExo4DDataLoader(Dataset):
             windows_df = pd.DataFrame(windows, columns=columns)
             windows_df.to_csv(self.window_csv_path, index=False)
             self.windows = windows_df
-            if self.curriculum_train:
+            if self.curriculum_train or self.model == "view_invariant":
                 cam_distances_df = pd.DataFrame(cam_dists, columns=["cam_ego_distance"])
                 cam_distances_df.to_csv(self.windows_cam_distances_path, index=False)
         else:
@@ -293,20 +306,17 @@ class EgoExo4DDataLoader(Dataset):
         return mask
 
     def get_distill_video_features(self, video_id, ego_cam, take_ego_id, start_sec, end_sec):
-        #TODO: Speed this up -> Cache the rankings?
-        distill_feature_views = [ego_cam for _ in range(self.duration)]
-        # Load default video features for the specified duration
         default_features_path = os.path.join(self.video_feature_path, f"{take_ego_id}.pt")
         try:
-            default_features = torch.load(default_features_path)[start_sec:end_sec]
+            stitched_features = torch.load(default_features_path)[start_sec:end_sec]
         except Exception as e:
             print(f"Error loading default features from {default_features_path}: {e}")
             return None
-        stitched_features = default_features.clone()
         take_uid = self.split_data[self.split_data['take_name'] == video_id]['take_uid'].iloc[0]
         atomic_narrations = self.atomic_descriptions_train.get(str(take_uid), [])
         if atomic_narrations:
             descriptions = atomic_narrations[0].get('descriptions', [])
+            loaded_features = {}
             for narr in descriptions:
                 try:
                     timestamp = int(round(narr['timestamp']))
@@ -314,10 +324,10 @@ class EgoExo4DDataLoader(Dataset):
                         feat_idx = timestamp - start_sec
                         best_exo = narr['best_exo']['cam_id']
                         take_exo_id = f"{video_id}_{best_exo}"
-                        exo_features_path = os.path.join(self.video_feature_path, f"{take_exo_id}.pt")
-                        exo_features = torch.load(exo_features_path)
-                        stitched_features[feat_idx] = exo_features[timestamp]
-                        distill_feature_views[feat_idx] = best_exo
+                        if take_exo_id not in loaded_features:
+                            exo_features_path = os.path.join(self.video_feature_path, f"{take_exo_id}.pt")
+                            loaded_features[take_exo_id] = torch.load(exo_features_path)[start_sec:end_sec]
+                        stitched_features[feat_idx] = loaded_features[take_exo_id][feat_idx]
                 except Exception as e:
                     pass
         return stitched_features
@@ -362,6 +372,7 @@ class EgoExo4DDataLoader(Dataset):
             
 
         if self.use_distill_nce_loss:
+            #TODO: Do we need to turn this off in evaluation?
             if self.stitched_best_exo_distill:
                 ego_video_features = self.get_distill_video_features(video_id, ego_cam, take_ego_id, start_sec, end_sec)
             else:

@@ -52,9 +52,8 @@ def get_text_pos(start_list, end_list, device='cuda'):
         batch_first=True, padding_value=0).to(device, non_blocking=True)
     return torch.stack((start_list, end_list), dim=-1)
 
-def get_loss(input_data, logits, text_padding_mask, args):
-    if args.model in ['init', 'cotrain']:
-        grounding_preds = logits['interval_preds']
+def get_grounding_loss_reg_head(input_data, logits, text_padding_mask, args):
+    grounding_preds = logits['interval_preds']
     device = grounding_preds.device
 
     # Store losses in loss_dict
@@ -109,7 +108,7 @@ def get_loss(input_data, logits, text_padding_mask, args):
         iou_count = (iou > theta).sum().item()  / (~text_padding_mask).sum().item() #NOTE: We do mean, not sum, bc AverageMeter muls by n
         loss_dict[f'IoU>={theta}'] = iou_count
     # Combine losses into a single loss term:
-    loss_dict['loss'] = loss_dict['IoU loss']
+    loss_dict['loss'] = loss_dict['IoU loss'].clone()
     if args.use_center_duration:
         loss_dict['loss'] += loss_dict['Duration L1 loss']
         loss_dict['loss'] += loss_dict['Center L1 loss']
@@ -118,6 +117,55 @@ def get_loss(input_data, logits, text_padding_mask, args):
     if args.use_distill_nce_loss and 'InfoNCE loss' in loss_dict.keys():
         loss_dict['loss'] += loss_dict['InfoNCE loss']
     return loss_dict, iou
+
+def get_view_invariant_loss(input_data, logits, text_padding_mask, args):
+    features = logits['high_dim_features']
+    device = features.device
+    ego_seq = input_data['ego_video_features'].to(device, non_blocking=True)
+    logits['distill_infonce_loss'] = compute_info_nce_loss(features, ego_seq)
+    # Store losses in loss_dict
+
+    loss_dict = {}
+    loss_dict['L1 loss'] = F.l1_loss(features, ego_seq, reduction='mean')
+    # Initialize total loss with L1 loss
+    total_loss = loss_dict['L1 loss'].clone()
+    # Conditionally add InfoNCE loss if specified in args
+    if args.use_distill_nce_loss:
+        loss_dict['InfoNCE loss'] = logits['distill_infonce_loss']
+        total_loss += loss_dict['InfoNCE loss']
+    # Store the total loss under the key 'total loss'
+    loss_dict['loss'] = total_loss
+    return loss_dict, None 
+
+def compute_info_nce_loss(features1, features2, temperature=0.1):
+    """
+    Compute the InfoNCE loss between two sequences of features.
+    
+    Args:
+    - features1 (torch.Tensor): Tensor of shape (batch_size, seq_length, feature_dim)
+    - features2 (torch.Tensor): Tensor of shape (batch_size, seq_length, feature_dim)
+    - temperature (float): A temperature scaling factor (default 0.1)
+    
+    Returns:
+    - torch.Tensor: Scalar tensor containing the InfoNCE loss.
+    """
+
+    # Normalize features to get unit vectors
+    features1 = F.normalize(features1, p=2, dim=2)
+    features2 = F.normalize(features2, p=2, dim=2)
+    similarities = torch.bmm(features1, features2.transpose(1, 2)) / temperature
+    labels = torch.arange(features2.size(1)).to(features1.device)
+    log_prob = F.log_softmax(similarities, dim=2)
+    log_prob_positive = log_prob.gather(2, labels.view(1, -1).expand(features1.size(0), -1).unsqueeze(2)).squeeze(2)
+    # Compute the mean of the log probabilities of the positive samples
+    nce_loss = -log_prob_positive.mean()
+    return nce_loss
+
+def get_loss(input_data, logits, text_padding_mask, args):
+    if args.model in ['view_invariant']:
+        return get_view_invariant_loss(input_data, logits, text_padding_mask, args)
+    elif args.model in ['grounding']:
+        return get_grounding_loss_reg_head(input_data, logits, text_padding_mask, args)
 
 def visualize(input_data, logits, args, epoch):
     sentences = input_data['metadata']['narrations']
@@ -222,3 +270,60 @@ def annotate_frame(frame, narrs, starts, ends, pad_mask, current_frame, start_fr
             cv2.putText(frame, f"{label}: {narr}", (x, y), font, font_scale, (0, 0, 0), 1)  # Black text
 
     return frame
+
+""" def get_grounding_loss(input_data, 
+             text_embed, logits, args, abs_text_pos):
+    
+    logits_joint = logits['logits_joint']
+    ego_seq = input_data['ego_video_features'].to(device, non_blocking=True)
+    text_padding_mask = input_data['text_padding_mask'].to(device, non_blocking=True)
+
+    if args.sim == 'cos':
+        logits_joint = logits_joint / 0.07
+
+    device = logits_joint.device
+    B, T, _ = ego_seq.shape
+    N = text_embed.shape[1]
+    num_joint_layers = logits_joint.shape[1]
+
+    loss_dict = {}
+
+    # binary tgt: B,T,B,N
+    binary_tgt_raw, _, _ = get_mask_from_time(
+        input_data['start'], input_data['end'],
+        num_timestamp=T, num_text=N, device=device)  # B,N,T
+    binary_tgt = rearrange(binary_tgt_raw, 'b n t -> b t n').unsqueeze(2).repeat(1,1,B,1) * torch.eye(
+        B, device=device)[:,None,:,None]
+    flatten_text = np.array([item for sublist in input_data['text'] for item in sublist])
+
+    ### prepare tgt ###
+    no_padding_binary_tgt = binary_tgt[:,:,~text_padding_mask.bool()]
+    no_padding_binary_tgt = no_padding_binary_tgt.view(B*T,-1)
+    video_mask_with_pos = no_padding_binary_tgt.sum(-1) > 0
+    text_mask_with_pos = no_padding_binary_tgt.sum(-2) > 0
+
+    ### get logits for joint model ###
+    no_padding_logits_joint = logits_joint[:,:,:,~text_padding_mask.bool()]
+    no_padding_logits_joint = no_padding_logits_joint.permute(1,0,2,3).reshape(num_joint_layers, B*T, -1)
+    no_padding_logits_joint_pos = no_padding_logits_joint.clone()
+    no_padding_logits_joint_pos[:,~no_padding_binary_tgt.bool()] = - 6e4
+
+    v_numerator_joint = torch.logsumexp(no_padding_logits_joint_pos, dim=-1)
+    v_denomenator_joint = torch.logsumexp(no_padding_logits_joint, dim=-1)
+    v_loss_milnce_joint = (v_denomenator_joint - v_numerator_joint)[:,video_mask_with_pos.bool()]
+    
+    t_numerator_joint = torch.logsumexp(no_padding_logits_joint_pos, dim=-2)
+    t_denomenator_joint = torch.logsumexp(no_padding_logits_joint, dim=-2)
+    t_loss_milnce_joint = (t_denomenator_joint - t_numerator_joint)[:,text_mask_with_pos.bool()]
+
+    loss_joint = (v_loss_milnce_joint.mean() + t_loss_milnce_joint.mean()) / 2
+    loss_dict['loss-joint'] = loss_joint.detach()
+    
+    ### compute the final loss ###
+    bce_weight = 1
+    nce_weight = 0 if args.optim_policy == 'bce' else 1 
+
+    loss = loss_joint
+    loss_dict['loss'] = loss
+
+    return loss_dict """

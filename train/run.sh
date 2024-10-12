@@ -28,6 +28,7 @@ srun --label torchrun --nproc_per_node=8 \
     --use_keysteps \
     --views all \
     --exos all \
+    --model view_invariant \
     --use_distill_nce_loss \
     --stitched_best_exo_distill \
     --name_prefix $1
@@ -36,3 +37,4 @@ srun --label torchrun --nproc_per_node=8 \
 ### --curriculum_train \
 ### --start_frac 0.1 \
 ### --end_epoch_frac 0.5 \
+### --stitched_best_exo_distill \
