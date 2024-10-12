@@ -26,3 +26,4 @@ main.pdf
 */vid_to_asr.json
 *.pth
 visualization/
+model/__pycache__
