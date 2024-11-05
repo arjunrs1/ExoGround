@@ -155,10 +155,8 @@ class ExoGroundingTransformer(nn.Module):
 
         if self.use_distill_nce_loss and egocentric_video_embed is not None:
             exo_features_projected = self.exo_feature_proj(video_encoded_features)
-            distill_loss = self.compute_info_nce_loss(exo_features_projected, egocentric_video_embed)
         elif self.multi_view and self.use_pairwise_distill_nce_loss:
             exo_features_projected = self.exo_feature_proj(video_encoded_features)
-            distill_loss = self.compute_pairwise_info_nce_loss(exo_features_projected, view_mask=view_mask if self.pairwise_distill_mode == "all" else ~video_padding_mask)
 
         # get multi-modal feature output from encoder   
         all_output, _ = self.get_joint_feature(
@@ -180,7 +178,8 @@ class ExoGroundingTransformer(nn.Module):
 
         output_dict = {'interval_preds': grounding}
         if self.use_distill_nce_loss or self.use_pairwise_distill_nce_loss:
-            output_dict['distill_infonce_loss'] = distill_loss
+            output_dict['high_dim_features'] = exo_features_projected
+        #    output_dict['distill_infonce_loss'] = distill_loss
 
         return output_dict
 

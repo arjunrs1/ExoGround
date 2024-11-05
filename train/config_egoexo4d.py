@@ -6,7 +6,7 @@ from datetime import datetime
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--seed', default=888,type=int)
-    parser.add_argument('--model', default='grounding', choices=['view_invariant', 'grounding'], type=str)
+    parser.add_argument('--model', default='joint', choices=['view_invariant', 'grounding', 'joint'], type=str)
     parser.add_argument('--language_model', default='word2vec', type=str)
     parser.add_argument('--dataset', default='egoexo4d', type=str)
     parser.add_argument('--seq_len', default=64, type=int)
@@ -44,6 +44,7 @@ def parse_args():
     parser.add_argument('--use_alignability_head', default=0, type=int)
     parser.add_argument('--momentum_m', default=0.999, type=float)
     parser.add_argument('--iou_thresholds', nargs='+', type=float, default=[0.1, 0.3, 0.5, 0.7])
+    parser.add_argument('--minimum_four_exo_takes', action='store_true')
 
     # transformer
     parser.add_argument('--hidden_dim', default=256, type=int)
@@ -68,18 +69,22 @@ def parse_args():
     parser.add_argument('--start_frac', default=0.50, type=float) #percentage of initial data for training (curriculum learning)
     parser.add_argument('--end_epoch_frac', default=0.75, type=float) #percentage of max_epochs by which we should be training on all data (curriculum learning)
     parser.add_argument('--stitched_best_exo_distill', action='store_true', default=False)
+    parser.add_argument('--same_view_negative', action='store_true', default=False)
 
     #data dimensions
     parser.add_argument('--video_feature_dim', default=4096, type=int)
     parser.add_argument('--text_feature_dim', default=4096, type=int)
     parser.add_argument('--audio_feature_dim', default=2304, type=int)
     parser.add_argument('--feature_dim', default=512, type=int)
+    parser.add_argument('--use_egovlp_features', action='store_true', default=False)
     
     # inference
     parser.add_argument('--worker_id', default=None, type=int)
-    parser.add_argument('--visualize', action='store_true')
+    parser.add_argument('--visualize', action='store_true', default=False)
     parser.add_argument('--vis_freq', default=1, type=int)
     parser.add_argument('--visualization_videos_per_epoch', default=5, type=int)
+    parser.add_argument('--test_egovlp', action='store_true', default=False)
+    parser.add_argument('--vi_encoder_path', default='/private/home/arjunrs1/exo_narration_grounding/ExoGround/train/log/neg_cos_2024_10_18_19_01_view_invariant_iou_l1_egoexo4d_len64_e6d6_bs16_lr0.0001_view=all_distill=True_pair_ds=False_pair_ds_mode=all_multi_ego=False_narr_rand=False/model/epoch99.pth.tar', type=str)
     args = parser.parse_args()
     return args
 

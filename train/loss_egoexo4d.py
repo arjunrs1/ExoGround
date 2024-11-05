@@ -13,6 +13,7 @@ import ffmpeg
 from torch.nn.utils.rnn import pad_sequence
 import cv2
 from moviepy.editor import VideoFileClip
+from collections import Counter
 
 def circulant(tensor, dim):
     """get a circulant version of the tensor along the {dim} dimension.
@@ -52,8 +53,28 @@ def get_text_pos(start_list, end_list, device='cuda'):
         batch_first=True, padding_value=0).to(device, non_blocking=True)
     return torch.stack((start_list, end_list), dim=-1)
 
+def get_mode_cam_rank(batch_cam_rank_metadata):
+    mode_cam_rank = []
+    for cam_rank_metadata in batch_cam_rank_metadata:
+        count = Counter(cam_rank_metadata)
+        mode = max(count, key=count.get)
+        mode_cam_rank.append(mode)
+    return mode_cam_rank
+
+def expand_ranks_with_mask(modes, text_padding_mask):
+    expanded_modes = []
+    for i, mask_row in enumerate(text_padding_mask):
+        mode_string = modes[i]
+        for mask_value in mask_row:
+            if mask_value == 0:
+                expanded_modes.append(mode_string)
+    return expanded_modes
+
 def get_grounding_loss_reg_head(input_data, logits, text_padding_mask, args):
     grounding_preds = logits['interval_preds']
+    per_second_views = input_data['metadata']['per_second_views']
+    cam_ranks = get_mode_cam_rank(per_second_views)
+    cam_ranks_expanded = expand_ranks_with_mask(cam_ranks, text_padding_mask)  
     device = grounding_preds.device
 
     # Store losses in loss_dict
@@ -98,15 +119,22 @@ def get_grounding_loss_reg_head(input_data, logits, text_padding_mask, args):
     # Compute IoU loss for valid intervals
     intersection = torch.clamp(torch.min(ends_pred_trunc, ends_gt_trunc) - torch.max(starts_pred_trunc, starts_gt_trunc), min=0)
     union = torch.max(ends_pred_trunc, ends_gt_trunc) - torch.min(starts_pred_trunc, starts_gt_trunc)
-    iou = intersection / (union + args.iou_loss_eps) #TODO: Why is union zero???
+    iou = intersection / (union + args.iou_loss_eps)
     iou_loss = 1.0 - iou.mean()  # IoU loss is 1 - IoU
     loss_dict['IoU loss'] = iou_loss
     loss_dict['mean IoU'] = iou.mean()
-    if args.use_distill_nce_loss and 'distill_infonce_loss' in logits.keys():
-        loss_dict['InfoNCE loss'] = logits['distill_infonce_loss']
     for theta in args.iou_thresholds:
-        iou_count = (iou > theta).sum().item()  / (~text_padding_mask).sum().item() #NOTE: We do mean, not sum, bc AverageMeter muls by n
+        iou_count = (iou > theta).sum().item()  / (~text_padding_mask).sum().item()
         loss_dict[f'IoU>={theta}'] = iou_count
+    if args.test:
+        for cam_rank in set(cam_ranks_expanded):
+            rank_iou = iou[torch.tensor([r == cam_rank for r in cam_ranks_expanded])]
+            for theta in args.iou_thresholds:
+                cam_rank_theta_key = f'Rank {cam_rank} IoU>={theta}'
+                iou_count = (rank_iou > theta).sum().item() / len(rank_iou)
+                loss_dict[cam_rank_theta_key] = {}
+                loss_dict[cam_rank_theta_key]['mean'] = iou_count
+                loss_dict[cam_rank_theta_key]['count'] = len(rank_iou)
     # Combine losses into a single loss term:
     loss_dict['loss'] = loss_dict['IoU loss'].clone()
     if args.use_center_duration:
@@ -114,28 +142,182 @@ def get_grounding_loss_reg_head(input_data, logits, text_padding_mask, args):
         loss_dict['loss'] += loss_dict['Center L1 loss']
     else:
         loss_dict['loss'] += loss_dict['Timestamp L1 loss']
-    if args.use_distill_nce_loss and 'InfoNCE loss' in loss_dict.keys():
-        loss_dict['loss'] += loss_dict['InfoNCE loss']
     return loss_dict, iou
 
-def get_view_invariant_loss(input_data, logits, text_padding_mask, args):
-    features = logits['high_dim_features']
-    device = features.device
-    ego_seq = input_data['ego_video_features'].to(device, non_blocking=True)
-    logits['distill_infonce_loss'] = compute_info_nce_loss(features, ego_seq)
-    # Store losses in loss_dict
+def flatten_list_of_lists(list_of_lists):
+    """Flatten a list of lists into a single list."""
+    return [item for sublist in list_of_lists for item in sublist]
 
+def get_view_invariant_loss(input_data, logits, args):
+    features = logits['high_dim_features'] if not args.test_egovlp else input_data['video_features']
+    device = features.device
+
+    view_rank_names = input_data['metadata']['per_second_views']
+    ego_seq = input_data['ego_video_features'].to(device, non_blocking=True)
+    positive_feature_idxs = input_data['view_rank_label'].to(device, non_blocking=True)
+    negative_feature_idxs = input_data['view_rank_neg_label'].to(device, non_blocking=True)
+    #valid_views_mask = input_data['valid_views_mask'].to(device, non_blocking=True)
+    if args.same_view_negative:
+        same_view_neg_idxs = input_data['same_view_neg_idxs'].to(device, non_blocking=True)
+        same_view_features = input_data['video_features'].to(device, non_blocking=True)
+    else:
+        same_view_neg_idxs = None
+        same_view_features = None
+
+    info_nce_losses = compute_info_nce_loss_cross_view(features, ego_seq, positive_feature_idxs, negative_feature_idxs, same_view_neg_idxs, same_view_features)
+    l1_losses, pos_cos_sim, avg_neg_cos_sim = compute_l1_cosine_losses(features, ego_seq, positive_feature_idxs, negative_feature_idxs)
+
+    flat_view_rank_names = flatten_list_of_lists(view_rank_names)
+    flat_l1_losses = l1_losses.flatten()
+    flat_pos_cosine_similarities = pos_cos_sim.flatten()
+    flat_neg_cosine_similarities = avg_neg_cos_sim.flatten()
+    flat_info_nce_losses = info_nce_losses.flatten()
     loss_dict = {}
-    loss_dict['L1 loss'] = F.l1_loss(features, ego_seq, reduction='mean')
-    # Initialize total loss with L1 loss
-    total_loss = loss_dict['L1 loss'].clone()
-    # Conditionally add InfoNCE loss if specified in args
+    # Accumulate losses/metrics into proper view rank bin
+    for i, view_name in enumerate(flat_view_rank_names):
+        prefix = f"Rank {view_name}"
+        metrics = ["L1", "pos_cosine", "avg_neg_cosine", "InfoNCE"]
+        losses = [flat_l1_losses[i], flat_pos_cosine_similarities[i], flat_neg_cosine_similarities[i], flat_info_nce_losses[i]]
+        for metric, loss in zip(metrics, losses):
+            key = f"{prefix} {metric}"
+            if key not in loss_dict:
+                loss_dict[key] = {'total': 0.0, 'count': 0}
+            loss_dict[key]['total'] += loss.item()
+            loss_dict[key]['count'] += 1
+    # Compute the average for each metric
+    for key in loss_dict:
+        loss_dict[key]['mean'] = loss_dict[key]['total'] / loss_dict[key]['count']
+
+    # Compute mean losses:
+    loss_dict["L1 loss"] = l1_losses.mean()
+    loss_dict["Pos cosine sim"] = pos_cos_sim.mean() #NOTE: Cosine loss does not contribute to loss
+    loss_dict["Avg neg cosine sim"] = avg_neg_cos_sim.mean() #NOTE: Cosine loss does not contribute to loss
     if args.use_distill_nce_loss:
-        loss_dict['InfoNCE loss'] = logits['distill_infonce_loss']
-        total_loss += loss_dict['InfoNCE loss']
-    # Store the total loss under the key 'total loss'
+        loss_dict['InfoNCE loss'] = info_nce_losses.mean()
+        total_loss = loss_dict['InfoNCE loss'].clone()
     loss_dict['loss'] = total_loss
-    return loss_dict, None 
+    return loss_dict, None
+
+def compute_l1_cosine_losses(output_features, video_features, positive_indices, negative_indices):
+    """
+    Compute the L1 loss and cosine similarity between output features and positive features.
+    
+    Args:
+    - output_features (torch.Tensor): Tensor of shape (batch_size, seq_len, feat_dim)
+    - video_features (torch.Tensor): Tensor of shape (batch_size, max_num_views, seq_len, feat_dim)
+    - positive_indices (torch.Tensor): Tensor of shape (batch_size, seq_len) containing indices of the positive views
+    - positive_indices (torch.Tensor): Tensor of shape (batch_size, seq_len) containing indices of the positive views
+
+    Returns:
+    - torch.Tensor: Scalar tensor containing the L1 loss.
+    - torch.Tensor: Scalar tensor containing the cosine similarity.
+    """
+    batch_size, seq_len, feat_dim = output_features.shape
+    max_num_views = video_features.size(1)
+    # Gather positive features using positive_indices
+    positive_features = torch.gather(video_features, 1, positive_indices.unsqueeze(1).unsqueeze(-1).expand(-1, -1, seq_len, feat_dim))
+    positive_features = positive_features.squeeze(1)  # Remove the singleton dimension after gather
+
+    # Gather negative features using positive_indices
+    negative_features = torch.gather(video_features, 1, negative_indices.unsqueeze(1).unsqueeze(-1).expand(-1, -1, seq_len, feat_dim))
+    negative_features = negative_features.squeeze(1)
+    
+    output_features_normalized = F.normalize(output_features, p=2, dim=2)
+    positive_features_normalized = F.normalize(positive_features, p=2, dim=2)
+    negative_features_normalized = F.normalize(negative_features, p=2, dim=2)
+    # Compute L1 loss per timestep per sample
+    l1_loss = F.l1_loss(output_features_normalized, positive_features_normalized, reduction='none').mean(dim=2)
+    pos_cosine_similarity = (output_features_normalized * positive_features_normalized).sum(dim=2)
+    neg_cosine_similarity = (output_features_normalized * negative_features_normalized).sum(dim=2)
+    
+    return l1_loss, pos_cosine_similarity, neg_cosine_similarity
+
+def compute_info_nce_loss_cross_view_OLD(output_features, video_features, positive_indices, valid_views_mask, temperature=0.1):
+    """
+    Compute the InfoNCE loss for a batch of features with multiple views, aligning each output feature with a specific "positive" view.
+    
+    Args:
+    - output_features (torch.Tensor): Tensor of shape (batch_size, seq_length, feature_dim)
+    - video_features (torch.Tensor): Tensor of shape (batch_size, num_views, seq_length, feature_dim)
+    - positive_indices (torch.Tensor): Tensor of shape (batch_size, seq_length) containing indices of the positive views
+    - valid_views_mask (torch.Tensor): Boolean tensor of shape (batch_size, num_views, seq_len) indicating valid views. Set to False everywhere except the positive indices at each step in the sequence.
+    - temperature (float): A temperature scaling factor (default 0.1)
+    
+    Returns:
+    - torch.Tensor: Scalar tensor containing the InfoNCE loss.
+    """
+    batch_size, seq_length, feature_dim = output_features.shape
+    # Normalize features
+    output_features = F.normalize(output_features, p=2, dim=2)
+    video_features = F.normalize(video_features, p=3, dim=3)
+    # Compute similarities between all pairs of features across all views and all timesteps
+    similarities = torch.einsum('bsf,bvsf->bsv', output_features, video_features) / temperature
+    # Mask out similarities for invalid views
+    #similarities = similarities.masked_fill(~valid_views_mask.unsqueeze(1).expand(-1, seq_length, -1), float('-inf'))
+    #print(f"valid views mask: {valid_views_mask}")
+    similarities = similarities.masked_fill(~valid_views_mask.transpose(1,2), float('-inf'))
+    #print(f"similarities: {similarities.mean()}")
+    #TODO: Should we do log softmax before doing the inf fill? Doesn't make sense otherwise
+    log_prob = F.log_softmax(similarities, dim=2)
+    #print(f"Sample sim: {similarities[0, 0]} log_prob slice:{log_prob[0, 0]}")
+    # Gather log probabilities of positive samples
+    log_prob_positive = torch.gather(log_prob, 2, positive_indices.unsqueeze(2)).squeeze(2)
+    # Compute the mean of the log probabilities of the positive samples
+    #nce_loss = -log_prob_positive.mean()
+    return -log_prob_positive
+
+def compute_info_nce_loss_cross_view(output_features, video_features, positive_indices, negative_indices, same_view_neg_idxs=None, same_view_features=None, temperature=0.1):
+    """
+    Compute the InfoNCE loss using positive and negative indices.
+    Args:
+    - output_features (torch.Tensor): Tensor of shape (batch_size, seq_len, feat_dim)
+    - video_features (torch.Tensor): Tensor of shape (batch_size, max_num_views, seq_len, feat_dim)
+    - positive_indices (torch.Tensor): Tensor of shape (batch_size, seq_len) containing indices of the positive views
+    - negative_indices (torch.Tensor): Tensor of shape (batch_size, seq_len) containing indices of the negative views
+    - same_view_neg_idxs (torch.Tensor): Tensor of shape (batch_size, seq_len) containing indices of negative views from the same (source) video
+    - temperature (float): A temperature scaling factor (default 0.1)
+    Returns:
+    - torch.Tensor: Scalar tensor containing the InfoNCE loss.
+    """
+    # Normalize features
+    output_features_normalized = F.normalize(output_features, p=2, dim=2)
+    # Gather positive and negative features
+    positive_features = torch.gather(
+        video_features, 
+        1, 
+        positive_indices.unsqueeze(1).unsqueeze(-1).expand(-1, -1, output_features.size(1), output_features.size(2))
+    ).squeeze(1)
+    negative_features = torch.gather(
+        video_features, 
+        1, 
+        negative_indices.unsqueeze(1).unsqueeze(-1).expand(-1, -1, output_features.size(1), output_features.size(2))
+    ).squeeze(1)
+    # Normalize positive and negative features
+    positive_features_normalized = F.normalize(positive_features, p=2, dim=2)
+    negative_features_normalized = F.normalize(negative_features, p=2, dim=2)
+    # Compute similarities
+    pos_similarities = (output_features_normalized * positive_features_normalized).sum(dim=2) / temperature
+    neg_similarities = (output_features_normalized * negative_features_normalized).sum(dim=2) / temperature
+    # Concatenate positive and negative similarities
+    # Concatenate positive and negative similarities
+    if same_view_neg_idxs is not None:
+        same_view_negative_features = torch.gather(
+            same_view_features, 
+            1, 
+            same_view_neg_idxs.unsqueeze(-1).expand(-1, -1, same_view_features.size(-1))
+        )
+        same_view_negative_features_normalized = F.normalize(same_view_negative_features, p=2, dim=2)
+        same_view_neg_similarities = (output_features_normalized * same_view_negative_features_normalized).sum(dim=2) / temperature
+        similarities = torch.cat([pos_similarities.unsqueeze(2), neg_similarities.unsqueeze(2), same_view_neg_similarities.unsqueeze(2)], dim=2)
+    else:
+        similarities = torch.cat([pos_similarities.unsqueeze(2), neg_similarities.unsqueeze(2)], dim=2)
+    # Compute log probabilities
+    log_prob = F.log_softmax(similarities, dim=2)
+    # Gather log probabilities of positive samples
+    log_prob_positive = log_prob[:, :, 0]
+    # Compute the mean of the log probabilities of the positive samples
+    nce_loss = -log_prob_positive
+    return nce_loss
 
 def compute_info_nce_loss(features1, features2, temperature=0.1):
     """
@@ -163,9 +345,19 @@ def compute_info_nce_loss(features1, features2, temperature=0.1):
 
 def get_loss(input_data, logits, text_padding_mask, args):
     if args.model in ['view_invariant']:
-        return get_view_invariant_loss(input_data, logits, text_padding_mask, args)
-    elif args.model in ['grounding']:
+        return get_view_invariant_loss(input_data, logits, args)
+    elif (args.model in ['grounding']) or ((args.model in ['joint']) and (not args.use_distill_nce_loss)):
         return get_grounding_loss_reg_head(input_data, logits, text_padding_mask, args)
+    elif args.model in ['joint']:
+        gnd_loss_dict, iou = get_grounding_loss_reg_head(input_data, logits, text_padding_mask, args)
+        vi_loss_dict, _ = get_view_invariant_loss(input_data, logits, args)
+        # Combine the loss values
+        combined_loss = vi_loss_dict['loss'] + gnd_loss_dict['loss']
+        # Merge the dictionaries
+        combined_loss_dict = {**vi_loss_dict, **gnd_loss_dict}
+        # Update the combined loss in the dictionary
+        combined_loss_dict['loss'] = combined_loss
+        return combined_loss_dict, iou
 
 def visualize(input_data, logits, args, epoch):
     sentences = input_data['metadata']['narrations']

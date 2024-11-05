@@ -181,7 +181,7 @@ def train(loader, model, optimizer, lr_scheduler, grad_scaler, device, epoch, ar
         # log stats
         if rank == 0 and args.iteration % 5 == 0:
             for k, v in loss_dict.items():
-                value = v if k.startswith('IoU>=') else v.item()
+                value = v if k.startswith('IoU>=') else (v['mean'] if k.startswith('Rank') else v.item())
                 args.train_plotter.add_data(f'train/{k}', value, args.iteration)
             args.train_plotter.add_data('train/lr', lr_scheduler.get_last_lr()[0], args.iteration)
             args.train_plotter.add_data('device/sps', 1/(time.time()-end), args.iteration)
@@ -267,17 +267,21 @@ def evaluate(loader, model, device, epoch, args):
                                  args=args)
     
         # Update IoU threshold metrics
-        if args.model in ['grounding']:
+        if args.model in ['grounding', 'joint']:
             for theta in args.iou_thresholds:
                 key = f'IoU>={theta}'
                 if key in loss_dict:
                     if key not in metric_meters:
                         metric_meters[key] = AverageMeter(key, ':.4f')
-                    metric_meters[key].update(loss_dict[key], int(text_padding_mask.sum()))
+                    metric_meters[key].update(loss_dict[key], int(~text_padding_mask.sum()))
 
         # Update other metrics
         for key, value in loss_dict.items():
-            if not key.startswith('IoU>='):
+            if "Rank" in key:
+                if key not in metric_meters:
+                    metric_meters[key] = AverageMeter(key, ':.4f')
+                metric_meters[key].update(value['mean'], value['count'])
+            elif not key.startswith('IoU>='):
                 if key not in metric_meters:
                     metric_meters[key] = AverageMeter(key, ':.4f')
                 metric_meters[key].update(value.item(), video_seq.size(0))
@@ -289,7 +293,7 @@ def evaluate(loader, model, device, epoch, args):
         batch_time.update(time.time() - end)
         end = time.time()
 
-        if args.test and args.model in ['grounding']:
+        if args.test and args.model in ['grounding', 'joint']:
             save_list.append({
                         'loss_dict': ious.cpu().detach().tolist(),
                         'metadata': {"narration": input_data['metadata']['narrations'], 
@@ -302,7 +306,7 @@ def evaluate(loader, model, device, epoch, args):
 
         # Visualization call
         if rank == 0 and (args.visualize and idx % args.vis_freq == 0 and not vis_this_epoch):
-            if args.model in ['grounding']:
+            if args.model in ['grounding', 'joint']:
                 visualize(input_data, logits, args, epoch)
                 vis_this_epoch = True
 
@@ -312,7 +316,7 @@ def evaluate(loader, model, device, epoch, args):
         for key, meter in metric_meters.items():
             args.train_plotter.add_data(f'val/{key}', meter.avg, epoch)
         
-        if args.test and args.model in ['grounding']:
+        if args.test and args.model in ['grounding', 'joint']:
             with open(os.path.join(args.log_path, f'test_results_epoch_{epoch}.json'), 'w') as f:
                 json.dump(save_list, f)
     
@@ -373,14 +377,16 @@ def get_dataset(args):
         curriculum_train=args.curriculum_train,
         stitched_best_exo_distill=args.stitched_best_exo_distill,
         model=args.model,
-        exo_mode=args.exos)
+        exo_mode=args.exos,
+        minimum_four_exo_takes=args.minimum_four_exo_takes,
+        same_view_negative=args.same_view_negative)
     val_dataset = D(
         split="val",
         duration=args.seq_len,
         hop_length=args.seq_hop,
         use_audio=args.use_audio,
         use_keysteps=args.use_keysteps,
-        views="exo" if args.model in ['grounding'] else "all",
+        views="exo" if args.model in ['grounding', 'joint'] else "all",
         use_distill_nce_loss=args.use_distill_nce_loss,
         use_center_duration=args.use_center_duration,
         multi_view_single_exo_inference=(args.views=="multi"),
@@ -388,7 +394,9 @@ def get_dataset(args):
         num_max_views=args.num_max_views,
         stitched_best_exo_distill=True if args.model in ['view_invariant'] else False, #TODO: Is this right??? Should we be fixing best_exo_distill in VI evaluation?
         model=args.model,
-        randomize_narration_order=False)
+        randomize_narration_order=False,
+        minimum_four_exo_takes=args.minimum_four_exo_takes,
+        same_view_negative=args.same_view_negative)
 
     if args.views == "all" and args.curriculum_train:
         train_sampler = CurriculumDistributedSampler(train_dataset, num_replicas=args.world_size, rank=args.rank, max_epochs=args.epochs, start_frac=args.start_frac, end_epoch_frac=args.end_epoch_frac)
@@ -419,7 +427,7 @@ def get_test_dataset(args):
         hop_length=args.seq_hop,
         use_audio=args.use_audio,
         use_keysteps=args.use_keysteps,
-        views="exo" if args.model in ['grounding'] else "all", #fix testing on all exo views
+        views="exo" if args.model in ['grounding', 'joint'] else "all", #fix testing on all exo views
         use_distill_nce_loss=args.use_distill_nce_loss,
         use_center_duration=args.use_center_duration,
         multi_view_single_exo_inference=(args.views=="multi"),
@@ -427,7 +435,9 @@ def get_test_dataset(args):
         num_max_views=args.num_max_views,
         stitched_best_exo_distill=True if args.model in ['view_invariant'] else False,
         model=args.model,
-        randomize_narration_order=False)
+        randomize_narration_order=False,
+        minimum_four_exo_takes=args.minimum_four_exo_takes,
+        same_view_negative=args.same_view_negative)
 
     test_sampler = DistributedSampler(test_dataset, num_replicas=args.world_size, rank=args.rank)
 
@@ -495,6 +505,9 @@ def main(args):
     if args.multi_view_egoexo:
         assert args.views == "multi"
 
+    if args.test_egovlp:
+        assert args.test
+
     args.num_max_views = 1 if not args.views == "multi" else args.num_max_views
     if args.multi_view_egoexo:
         args.num_max_views +=1 
@@ -513,6 +526,39 @@ def main(args):
 
     ### Model ###
     if args.model in ['grounding']:
+        if not args.use_egovlp_features:
+            vi_model = ViewInvariantMLP(num_encoder_layers=args.num_encoder_layers,
+                            num_decoder_layers=args.num_decoder_layers,
+                            use_decoder=args.use_decoder,
+                            sim=args.sim,
+                            pos_enc=args.pos_enc,
+                            use_text_pos_enc=args.use_text_pos_enc,
+                            use_audio=args.use_audio,
+                            video_embed_dim=args.video_feature_dim,
+                            text_embed_dim=args.text_feature_dim,
+                            audio_embed_dim=args.audio_feature_dim,
+                            feature_dim=args.feature_dim,
+                            use_distill_nce_loss=args.use_distill_nce_loss,
+                            multi_view= args.views == "multi",
+                            num_max_views=args.num_max_views,
+                            use_pairwise_distill_nce_loss=args.use_pairwise_distill_nce_loss,
+                            pairwise_distill_mode=args.pairwise_distill_mode
+            )
+            vi_checkpoint = torch.load(get_model_card(args.vi_encoder_path), map_location='cpu')
+            vi_model.to(device)
+            vi_model = DDP(vi_model, device_ids=[rank], find_unused_parameters=False)  # Wrap model with DDP
+            vi_model_without_dp = vi_model
+            try:
+                vi_model_without_dp.load_state_dict(vi_checkpoint['state_dict'])
+            except:
+                vi_model_without_dp.load_state_dict(vi_checkpoint['state_dict'], strict=False)
+                if rank == 0:
+                    print('[WARNING] Non-Equal load for testing!')
+            for param in vi_model.parameters():
+                param.requires_grad = False
+            vi_model.eval()
+        else:
+            vi_model = None
         model = GroundingModel(num_encoder_layers=args.num_encoder_layers,
                         num_decoder_layers=args.num_decoder_layers,
                         use_decoder=args.use_decoder,
@@ -528,7 +574,8 @@ def main(args):
                         multi_view= args.views == "multi",
                         num_max_views=args.num_max_views,
                         use_pairwise_distill_nce_loss=args.use_pairwise_distill_nce_loss,
-                        pairwise_distill_mode=args.pairwise_distill_mode
+                        pairwise_distill_mode=args.pairwise_distill_mode,
+                        vi_encoder=vi_model
         )
     elif args.model in ['view_invariant']:
         model = ViewInvariantMLP(num_encoder_layers=args.num_encoder_layers,
@@ -548,9 +595,27 @@ def main(args):
                         use_pairwise_distill_nce_loss=args.use_pairwise_distill_nce_loss,
                         pairwise_distill_mode=args.pairwise_distill_mode
         )
+    elif args.model in ['joint']:
+        model = ExoGroundingTransformer(num_encoder_layers=args.num_encoder_layers,
+                        num_decoder_layers=args.num_decoder_layers,
+                        use_decoder=args.use_decoder,
+                        sim=args.sim,
+                        pos_enc=args.pos_enc,
+                        use_text_pos_enc=args.use_text_pos_enc,
+                        use_audio=args.use_audio,
+                        video_embed_dim=args.video_feature_dim,
+                        text_embed_dim=args.text_feature_dim,
+                        audio_embed_dim=args.audio_feature_dim,
+                        feature_dim=args.feature_dim,
+                        use_distill_nce_loss=args.use_distill_nce_loss,
+                        multi_view= args.views == "multi",
+                        num_max_views=args.num_max_views,
+                        use_pairwise_distill_nce_loss=args.use_pairwise_distill_nce_loss,
+                        pairwise_distill_mode=args.pairwise_distill_mode
+        )
 
     model.to(device)
-    model = DDP(model, device_ids=[rank], find_unused_parameters=args.model in ['grounding'])  # Wrap model with DDP
+    model = DDP(model, device_ids=[rank], find_unused_parameters=args.model in ['grounding', 'joint'])  # Wrap model with DDP
     model_without_dp = model
 
     ### optimizer ###
@@ -585,7 +650,7 @@ def main(args):
             print('Start Inference ...')
         _, all_metric_meters = evaluate(test_loader, model, device, epoch, args)
         if rank == 0:
-            if args.model in ['grounding']:
+            if args.model in ['grounding', 'joint']:
                 mean_iou = []
                 for theta in args.iou_thresholds:
                     theta_threshold_name = f'IoU>={theta}'
@@ -593,10 +658,24 @@ def main(args):
                     print(f"{theta_threshold_name}: {theta_threshold_value:.4f}")
                     mean_iou.append(theta_threshold_value)
                 print(f"Mean IoU: {np.array(mean_iou).mean():.4f}")
-            elif args.model in ['view_invariant']:
-                for key, meter in all_metric_meters:
-                    stat_avg = meter.avg
-                    print(f"{key}: {stat_avg:.4f}")
+                print()
+                print("Per view grounding metrics:")
+                print()
+                for view_rank in ['0', '1', '2', '3', '4', '5', '6', 'unk', 'ego']:
+                    for theta in args.iou_thresholds:
+                        theta_threshold_rank_name = f'Rank {view_rank} IoU>={theta}'
+                        if theta_threshold_rank_name in all_metric_meters.keys():
+                            theta_threshold_rank_value = all_metric_meters[theta_threshold_rank_name].avg
+                            print(f"{theta_threshold_rank_name}: {theta_threshold_rank_value:.4f}")
+                    print()
+            if args.model in ['view_invariant', 'joint']:
+                for view_rank in ['0', '1', '2', '3', '4', '5', '6', 'unk', 'ego']:
+                    for key, meter in all_metric_meters.items():
+                        key_rank_pair = f"Rank {view_rank}"
+                        if key_rank_pair in key:
+                            stat_avg = meter.avg
+                            print(f"{key}: {stat_avg:.4f}")
+                    print()
 
         dist.barrier()
         sys.exit(0)

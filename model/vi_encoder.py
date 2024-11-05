@@ -205,26 +205,42 @@ class ViewInvariantMLP(nn.Module):
         self.use_pairwise_distill_nce_loss = use_pairwise_distill_nce_loss
         self.pairwise_distill_mode = pairwise_distill_mode
 
-        self.mlp = nn.Linear(self.video_embed_dim, self.video_embed_dim, bias=True)
-        """ self.mlp = nn.Sequential(
-            nn.Linear(self.video_embed_dim, 1024, bias=True),
+        #initalize video encoder
+        self.tfm_modules = []
+
+        self.linear_layers = []
+        self.video_pre_proj = nn.Linear(self.video_embed_dim, self.video_embed_dim, bias=False)
+        self.linear_layers.append(self.video_pre_proj)
+        self.ln_video_init = LayerNorm(self.video_embed_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(self.video_embed_dim, video_embed_dim, bias=True),
             nn.ReLU(),
-            nn.Linear(1024, self.video_embed_dim, bias=True),
-        ) """
+            nn.Linear(video_embed_dim, self.video_embed_dim, bias=True),
+        )
 
         self.initialize_parameters()
 
     def initialize_parameters(self):
-        if isinstance(self.mlp, nn.Linear):
-            nn.init.normal_(self.mlp.weight, std=0.01)
-            if self.mlp.bias is not None:
-                nn.init.zeros_(self.mlp.bias)
-        else:
-            for layer in self.mlp:
-                if isinstance(layer, nn.Linear):  # Check if the layer is a linear layer
-                    nn.init.normal_(layer.weight, std=0.01)
-                    if layer.bias is not None:
-                        nn.init.zeros_(layer.bias)
+        for layer in self.linear_layers:
+            nn.init.normal_(layer.weight, std=0.01)
+            if layer.bias is not None:
+                nn.init.zeros_(layer.bias)
+
+        for layer in self.mlp:
+            if isinstance(layer, nn.Linear):  # Check if the layer is a linear layer
+                nn.init.normal_(layer.weight, std=0.01)
+                if layer.bias is not None:
+                    nn.init.zeros_(layer.bias)
+
+        for tfm_module in self.tfm_modules:
+            proj_std = (tfm_module.width ** -0.5) * ((2 * tfm_module.layers) ** -0.5)
+            attn_std = tfm_module.width ** -0.5
+            fc_std = (2 * tfm_module.width) ** -0.5
+            for block in tfm_module.resblocks:
+                nn.init.normal_(block.attn.in_proj_weight, std=attn_std)
+                nn.init.normal_(block.attn.out_proj.weight, std=proj_std)
+                nn.init.normal_(block.mlp.c_fc.weight, std=fc_std)
+                nn.init.normal_(block.mlp.c_proj.weight, std=proj_std)
 
     def forward(self, video_embed, lang_embed,
                 video_padding_mask, lang_padding_mask,
@@ -233,6 +249,8 @@ class ViewInvariantMLP(nn.Module):
                 view_mask=None,
                 interpolate_from=None):
 
-        video_encoded_features = self.mlp(video_embed)    
+        proj_embed = self.ln_video_init(self.video_pre_proj(video_embed))
+
+        video_encoded_features = self.mlp(proj_embed)  
         output_dict = {'low_dim_features': video_encoded_features, 'high_dim_features': video_encoded_features}
         return output_dict

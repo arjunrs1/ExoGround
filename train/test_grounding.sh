@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=ExoGround_ks_all_test
-#SBATCH --output=/checkpoint/%u/slurm_logs/exoground/test_%j.out
-#SBATCH --error=/checkpoint/%u/slurm_logs/exoground/test_%j.out
+#SBATCH --output=/checkpoint/%u/slurm_logs/exoground/test_g_%j.out
+#SBATCH --error=/checkpoint/%u/slurm_logs/exoground/test_g_%j.out
 #SBATCH --partition=learnfair
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
@@ -40,10 +40,9 @@ srun --label torchrun --nproc_per_node=8 \
     --use_keysteps \
     --views all \
     --exos all \
-    --use_distill_nce_loss \
-    --curriculum_train \
-    --test /private/home/arjunrs1/exo_narration_grounding/ExoGround/train/log/stitch_curr_2024_09_25_19_07_init_iou_l1_egoexo4d_len64_e6d6_pos-learned_textpos-0_policy-default_bs16_lr0.0001_audio=False_decoder=True_keysteps=True_view=all_meandur=True_distill=True_pair_ds=False_pair_ds_mode=all_multi_ego=False_narr_rand=False/model/epoch38.pth.tar \
-    --visualize \
+    --model grounding \
+    --use_egovlp_features \
+    --test /private/home/arjunrs1/exo_narration_grounding/ExoGround/train/log/egovlp_g_2024_10_22_23_14_grounding_iou_l1_egoexo4d_len64_e6d6_bs16_lr0.0001_view=all_distill=False_pair_ds=False_pair_ds_mode=all_multi_ego=False_narr_rand=False/model/model_best_epoch45.pth.tar \
     --name_prefix $1
 
 ### --use_distill_nce_loss \

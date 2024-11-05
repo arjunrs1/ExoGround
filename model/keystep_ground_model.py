@@ -8,7 +8,7 @@ from transformers import BertModel, DistilBertModel
 import numpy as np
 from tfm_model import TemporalEncoder, TemporalDecoder, get_position_embedding_sine
 from word2vec_model import Word2VecModel
-from vi_encoder import ViewInvariantEncoder
+from vi_encoder import ViewInvariantMLP
 
 class GroundingModel(nn.Module):
     def __init__(self, 
@@ -28,30 +28,10 @@ class GroundingModel(nn.Module):
                  multi_view=False,
                  num_max_views=1,
                  use_pairwise_distill_nce_loss=False,
-                 pairwise_distill_mode="all"
+                 pairwise_distill_mode="all",
+                 vi_encoder=None
                  ):
         super().__init__()
-
-        self.view_invariant_encoder = ViewInvariantEncoder(
-            num_encoder_layers=num_encoder_layers,
-            num_decoder_layers=num_decoder_layers,
-            use_decoder=use_decoder,
-            sim=sim,
-            pos_enc=pos_enc,
-            use_text_pos_enc=use_text_pos_enc,
-            random_pos_start=random_pos_start,
-            use_audio=use_audio,
-            video_embed_dim=video_embed_dim,
-            text_embed_dim=text_embed_dim,
-            audio_embed_dim=audio_embed_dim,
-            feature_dim=feature_dim,
-            use_distill_nce_loss=use_distill_nce_loss,
-            multi_view=multi_view,
-            num_max_views=num_max_views,
-            use_pairwise_distill_nce_loss=use_pairwise_distill_nce_loss,
-            pairwise_distill_mode=pairwise_distill_mode
-        )
-        #TODO: Initialize this with argument in command line run.sh
 
         #initialize args
         self.num_encoder_layers = num_encoder_layers
@@ -78,17 +58,40 @@ class GroundingModel(nn.Module):
         self.multi_modal_encoder = TemporalEncoder(
             width=feature_dim, layers=self.num_encoder_layers, heads=8)
         self.tfm_modules.append(self.multi_modal_encoder)
+        if self.use_decoder:
+            self.decoder = TemporalDecoder(
+            width=feature_dim, layers=num_decoder_layers, heads=8)
+            self.tfm_modules.append(self.decoder)
+        self.grounding_head = nn.Linear(self.feature_dim, 2)
 
+        self.video_unimodal_encoder = TemporalEncoder(
+            width=feature_dim, layers=self.num_encoder_layers, heads=8)
+        self.tfm_modules.append(self.video_unimodal_encoder)
         self.text_unimodal_encoder = TemporalEncoder(
             width=feature_dim, layers=self.num_encoder_layers, heads=8)
         self.tfm_modules.append(self.text_unimodal_encoder)
 
+        #set the pre-trained view-invariant encoder model
+        self.vi_encoder = vi_encoder
+
         #initialize embeddings and projection layers
+        self.video_pre_proj = nn.Linear(self.video_embed_dim, self.feature_dim, bias=False)
         self.text_pre_proj = nn.Linear(self.text_embed_dim, self.feature_dim, bias=False)
         self.ln_text_init = LayerNorm(self.feature_dim)
+        self.ln_video_init = LayerNorm(self.feature_dim)
         self.ln_position_init = LayerNorm(self.feature_dim)
         self.ln_joint_post_enc = LayerNorm(self.feature_dim)
+        self.ln_video_post_enc = LayerNorm(self.feature_dim)
         self.ln_text_post_enc = LayerNorm(self.feature_dim)
+
+        #initialize exo projection layer for infoNCE loss
+        if self.use_distill_nce_loss or self.use_pairwise_distill_nce_loss:
+            self.exo_feature_proj = nn.Linear(self.feature_dim, self.video_embed_dim)
+
+        #initialize audio embeddings and projection layers
+        if self.use_audio:
+            self.ln_audio_init = LayerNorm(self.feature_dim)
+            self.audio_pre_proj = nn.Linear(self.audio_embed_dim, self.feature_dim, bias=False)
         
         # temporal positional encoding for video
         if self.pos_enc == 'learned':
@@ -107,7 +110,9 @@ class GroundingModel(nn.Module):
         self.initialize_parameters()
 
     def initialize_parameters(self):
-        linear_layers = [self.text_pre_proj, self.mlp]
+        linear_layers = [self.video_pre_proj, self.text_pre_proj, self.mlp, self.grounding_head]
+        if self.use_audio:
+            linear_layers.append(self.audio_pre_proj)
         for layer in linear_layers:
             nn.init.normal_(layer.weight, std=0.01)
             if layer.bias is not None:
@@ -130,13 +135,14 @@ class GroundingModel(nn.Module):
                 egocentric_video_embed=None,
                 view_mask=None,
                 interpolate_from=None):
-
-        #get video features from view_invariant encoder
-        video_output_dict = self.view_invariant_encoder(video_embed, lang_embed, video_padding_mask, lang_padding_mask, audio_embed, audio_padding_mask, egocentric_video_embed, view_mask, interpolate_from)
-        video_encoded_features = video_output_dict['low_dim_features']
-
         # text embedding without temporal-enc
         lang_embed_raw = self.get_textual_feature(lang_embed)
+
+        #get audio embedding
+        if audio_embed is not None:
+            audio_embed_feat = self.get_audio_feature(audio_embed)
+        else:
+            audio_embed_feat = None
 
         ### Joint Encoder ###
         # get text embedding with/without temporal pos-enc
@@ -149,32 +155,156 @@ class GroundingModel(nn.Module):
         #Get number of padded narrations
         N = lang_embed_with_time.shape[1]
 
+        #pass egovlp features through vi encoder:
+        if self.vi_encoder is not None:
+            with torch.no_grad():
+                vi_video_embed_dict = self.vi_encoder(video_embed, lang_embed, 
+                                                video_padding_mask, lang_padding_mask,
+                                                audio_embed=audio_embed, audio_padding_mask=audio_padding_mask,
+                                                egocentric_video_embed=egocentric_video_embed,
+                                                view_mask=view_mask,
+                                                interpolate_from=interpolate_from)
+                vi_video_embed = vi_video_embed_dict['high_dim_features']
+        else:
+            vi_video_embed = video_embed
+
+        video_encoded_features = self.get_unimodal_features("video", vi_video_embed, video_padding_mask).mean(dim=1) #TODO: Should we do this mean pooling over heads? or max-pool? (for both vid and narr features)
         text_encoded_features = self.get_unimodal_features("text", lang_embed_with_time, lang_padding_mask).mean(dim=1)
+
+        if self.use_distill_nce_loss and egocentric_video_embed is not None:
+            exo_features_projected = self.exo_feature_proj(video_encoded_features)
+            distill_loss = self.compute_info_nce_loss(exo_features_projected, egocentric_video_embed)
+        elif self.multi_view and self.use_pairwise_distill_nce_loss:
+            exo_features_projected = self.exo_feature_proj(video_encoded_features)
+            distill_loss = self.compute_pairwise_info_nce_loss(exo_features_projected, view_mask=view_mask if self.pairwise_distill_mode == "all" else ~video_padding_mask)
 
         # get multi-modal feature output from encoder   
         all_output, _ = self.get_joint_feature(
-            video_encoded_features, video_padding_mask,
+            video_encoded_features.squeeze(dim=1), video_padding_mask,
             text_encoded_features.squeeze(dim=1), lang_padding_mask,
+            audio_embed_feat, audio_padding_mask,
             interpolate_from)
 
-        joint_video_out = all_output[:, :, :-N]
-        joint_text_out = all_output[:, :, -N:]
+        decoder_context = all_output[:, :, :-N]
+        text_features = all_output[:, :, -N:]
 
-        # get cosine distance for Joint Encoder
-        video_feature_norm_joint = joint_video_out / joint_video_out.norm(dim=-1, keepdim=True)
-        text_feature_norm_joint = joint_text_out / joint_text_out.norm(dim=-1, keepdim=True)
-        contrastive_logits_joint = torch.einsum("astc,bskc->astbk", 
-            video_feature_norm_joint, text_feature_norm_joint)
+        if self.use_decoder:
+            decoder_output = self.decoder(x=text_features[:,-1,::].permute(1, 0, 2), memory=decoder_context[:,-1,::].permute(1, 0, 2), tgt_key_padding_mask=lang_padding_mask, memory_key_padding_mask=video_padding_mask)
+            decoder_text_features = decoder_output[-1].permute(1,0,2)
+            grounding = self.grounding_head(decoder_text_features)
+        else:
+            # Directly use text features from encoder output for grounding
+            grounding = self.grounding_head(text_features)
 
-        output_dict = {'logits_joint': contrastive_logits_joint}
-        
-        """ if self.return_dual_feature:
-            output_dict['dual_feature_video'] = video_feature_norm
-            output_dict['dual_feature_text'] = text_feature_norm
-        if self.use_alignability_head:
-            output_dict['dual_logits_alignability'] = self.binary_head(lang_embed_raw)
-            output_dict['joint_logits_alignability'] = self.binary_head(joint_text_out) """
+        output_dict = {'interval_preds': grounding}
+        if self.use_distill_nce_loss or self.use_pairwise_distill_nce_loss:
+            output_dict['distill_infonce_loss'] = distill_loss
+
         return output_dict
+
+    def add_positional_encoding(self, embed, interpolate_from=None):
+        B, T, _ = embed.shape
+        seq_len = T // self.num_max_views
+        if interpolate_from:
+            pos_embed_source = self.temporal_pos_embed[None, 0:interpolate_from, :]
+            pos_embed = F.interpolate(pos_embed_source.transpose(1, 2), size=seq_len, mode='linear', align_corners=False).transpose(1, 2)
+        else:
+            if self.random_pos_start:
+                pos_start_idx = np.random.randint(0, int(seq_len / 2))
+            else:
+                pos_start_idx = 0
+            pos_embed = self.temporal_pos_embed[None, pos_start_idx:pos_start_idx + seq_len, :]
+        pos_embed = pos_embed.repeat(1, self.num_max_views, 1)
+        embed_with_time = embed + self.ln_position_init(pos_embed)
+        return embed_with_time
+
+    def compute_info_nce_loss(self, features, positive_features, temperature=0.1):
+        """
+        Compute the InfoNCE loss between features and positive features, considering both positive and negative samples.
+        
+        Args:
+        - features (torch.Tensor): Tensor of shape (batch_size, num_features, feature_dim)
+        - positive_features (torch.Tensor): Tensor of shape (batch_size, num_features, feature_dim)
+        - temperature (float): A temperature scaling factor (default 0.1)
+        - view_mask (torch.Tensor): Boolean tensor of shape (batch_size, num_features) indicating available views
+        
+        Returns:
+        - torch.Tensor: Scalar tensor containing the InfoNCE loss.
+        """
+        assert features.size(1) == positive_features.size(1)
+        # Normalize features to get unit vectors
+        features_norm = F.normalize(features, p=2, dim=2)
+        positive_features_norm = F.normalize(positive_features, p=2, dim=2)
+        # Compute similarities
+        # Transpose positive features to align with features for matrix multiplication
+        similarities = torch.bmm(features_norm, positive_features_norm.transpose(1, 2)) / temperature
+        # Create labels for the positive samples (diagonal elements in the batch)
+        labels = torch.arange(positive_features.size(1)).to(features.device)
+        # Use log-softmax for numerical stability
+        log_prob = F.log_softmax(similarities, dim=2)
+        # Gather the log probabilities of positive samples
+        log_prob_positive = log_prob.gather(2, labels.view(1, -1).expand(features.size(0), -1).unsqueeze(2)).squeeze(2)
+        # Compute the mean of the log probabilities of the positive samples
+        nce_loss = -log_prob_positive.mean()
+        return nce_loss
+
+    def compute_pairwise_info_nce_loss(self, features, temperature=0.1, view_mask=None):
+        """
+        Compute the pairwise InfoNCE loss between all pairs of unmasked views for each item in the batch.
+        
+        Args:
+        - features (torch.Tensor): Tensor of shape (batch_size, num_features, feature_dim)
+        - temperature (float): A temperature scaling factor (default 0.1)
+        - view_mask (torch.Tensor): Boolean tensor of shape (batch_size, num_features) indicating available views
+        - num_splits (int): Number of splits along the feature dimension
+        
+        Returns:
+        - torch.Tensor: Scalar tensor containing the average pairwise InfoNCE loss.
+        """
+        # Split the features tensor and the view mask into parts along the second dimension
+        split_features = torch.chunk(features, self.num_max_views, dim=1)
+        split_masks = torch.chunk(view_mask, self.num_max_views, dim=1)
+        
+        total_loss = 0.0
+        num_valid_pairs = 0
+        
+        # Iterate over all pairs of feature chunks
+        for i in range(self.num_max_views):
+            for j in range(i + 1, self.num_max_views):
+                # Compute the valid mask by logical AND operation between masks of the two views
+                valid_mask = split_masks[i].squeeze(1) & split_masks[j].squeeze(1)
+                
+                if valid_mask.any():
+                    # Select valid features for both views
+                    valid_features_i = split_features[i][valid_mask]
+                    valid_features_j = split_features[j][valid_mask]
+
+                    valid_features_i = valid_features_i.unsqueeze(1)
+                    valid_features_j = valid_features_j.unsqueeze(1)
+                    
+                    # Normalize features to get unit vectors
+                    features_norm_i = F.normalize(valid_features_i, p=2, dim=2)
+                    features_norm_j = F.normalize(valid_features_j, p=2, dim=2)
+                    
+                    # Compute similarities
+                    similarities = torch.bmm(features_norm_i, features_norm_j.transpose(1, 2)) / temperature
+                    
+                    # Create labels for the positive samples (diagonal elements in the batch)
+                    labels = torch.arange(valid_features_i.size(1), device=features.device)
+                    
+                    # Use log-softmax for numerical stability
+                    log_prob = F.log_softmax(similarities, dim=2)
+                    log_prob_positive = log_prob.gather(2, labels.view(1, -1).expand(valid_features_i.size(0), -1).unsqueeze(2)).squeeze(2)
+                    
+                    # Compute the mean of the log probabilities of the positive samples
+                    nce_loss = -log_prob_positive.mean()
+                    
+                    total_loss += nce_loss
+                    num_valid_pairs += 1
+        
+        # Average the loss across all valid pairs
+        final_loss = total_loss / num_valid_pairs if num_valid_pairs > 0 else torch.tensor(0.0).to(features.device)
+        return final_loss
 
     def get_unimodal_features(self, mode, feat_embed, padding_mask, interpolate_from=None):
         B,T,_,= feat_embed.shape
@@ -207,19 +337,45 @@ class GroundingModel(nn.Module):
 
     def get_joint_feature(self, video_embed_with_time, video_padding_mask,
                           lang_embed_with_time, lang_padding_mask,
+                          audio_embed=None, audio_padding_mask=None,
                           interpolate_from=None):
         """Get the joint video embedding and text embedding from the joint encoder.
         It takes both visual and textual inputs."""
+        #video_embed = self.ln_video_init(self.video_pre_proj(video_embed))
         B,T,_,= video_embed_with_time.shape
+        seq_len = T // self.num_max_views
+        if interpolate_from:
+            pos_embed_source = self.temporal_pos_embed[None, 0:interpolate_from, :]
+            pos_embed = F.interpolate(pos_embed_source.transpose(1,2), 
+                size=seq_len, mode='linear', align_corners=False).transpose(1,2)
+        else:
+            if self.random_pos_start:
+                pos_start_idx = np.random.randint(0, int(seq_len/2))
+            else:
+                pos_start_idx = 0
+            pos_embed = self.temporal_pos_embed[None, pos_start_idx:pos_start_idx+seq_len, :]
+        pos_embed = pos_embed.repeat(1, self.num_max_views, 1)
+        #video_embed_with_time = video_embed + self.ln_position_init(pos_embed)
+        
+        if audio_embed is not None:
+            assert audio_embed.shape == video_embed_with_time.shape, "Audio and video inputs must match in all dimensions (batch size and timesteps and feature size)"
+            audio_embed_with_time = audio_embed + self.ln_position_init(pos_embed)
+            joint_embed = torch.cat((video_embed_with_time, audio_embed_with_time, lang_embed_with_time), dim=1)
+        else:
+            joint_embed = torch.cat((video_embed_with_time, lang_embed_with_time), dim=1)
 
-        joint_embed = torch.cat((video_embed_with_time, lang_embed_with_time), dim=1)
         joint_embed = joint_embed.permute(1,0,2) # BXC -> XBC
-        joint_padding_mask = torch.cat((video_padding_mask, lang_padding_mask), dim=1)
-
+        
+        if audio_embed is not None:
+            joint_padding_mask = torch.cat((video_padding_mask, audio_padding_mask, lang_padding_mask), dim=1)
+        else:
+            joint_padding_mask = torch.cat((video_padding_mask, lang_padding_mask), dim=1)
+        
         joint_output = self.multi_modal_encoder(joint_embed, joint_padding_mask)
         joint_output[-1] = self.ln_joint_post_enc(joint_output[-1])
 
         joint_output = torch.stack(joint_output, dim=1).permute(2,1,0,3)  # B,Stage,X,C
+
         return joint_output, T
 
 
@@ -245,4 +401,48 @@ class GroundingModel(nn.Module):
         """get text embedding after proj and LayerNorm"""
         text_proj = self.ln_text_init(self.text_pre_proj(lang_embed))
         return text_proj
+
+    def get_audio_feature(self, audio_embed):
+        """get audio embedding after proj and LayerNorm"""
+        aud_proj = self.ln_audio_init(self.audio_pre_proj(audio_embed))
+        return aud_proj
+
+
+class TwinExoGroundingTransformer(nn.Module):
+    """Duplicate TemporalAligner for EMA."""
+    def __init__(self, m=0.999, *args, **kwargs):
+        super().__init__()
+        self.m = m
+        self.online = ExoGroundingTransformer(*args, **kwargs)  # update by backprop
+        self.target = ExoGroundingTransformer(*args, **kwargs)  # update by EMA
+        self._copy_param()
+        self.bert = self.online.bert
+        self.get_visual_feature = self.online.get_visual_feature
+        self.get_joint_feature = self.online.get_joint_feature
+        self.get_textual_feature_with_time = self.online.get_textual_feature_with_time
+        self.get_textual_feature = self.online.get_textual_feature
+        self.get_text_visual_sim = self.online.get_text_visual_sim
+        self.get_text_visual_sim_dual = self.online.get_text_visual_sim_dual
+        self.get_alignability = self.online.get_alignability 
+
+        # turn off online branch's random pos enc
+        self.target.random_pos_start = 0
+
+    def _copy_param(self):
+        for param_online, param_target in zip(self.online.parameters(), self.target.parameters()):
+            param_target.data.copy_(param_online.data)  # initialize
+            param_target.requires_grad = False  # not update by gradient
+
+    @torch.no_grad()
+    def _momentum_update(self):
+        '''Momentum update of the target encoder'''
+        for param_online, param_target in zip(self.online.parameters(), self.target.parameters()):
+            param_target.data = param_target.data * self.m + param_online.data * (1. - self.m)
+    
+    def forward(self, *args, **kwargs):
+        return self.online(*args, **kwargs)
+
+    @torch.no_grad()
+    def forward_from_ema(self, *args, **kwargs):
+        return self.target(*args, **kwargs)
 
