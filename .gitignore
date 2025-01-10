@@ -25,5 +25,5 @@ main.pdf
 */vid_to_path.json
 */vid_to_asr.json
 *.pth
-visualization/
+visualization/*.png
 model/__pycache__
