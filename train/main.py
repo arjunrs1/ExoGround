@@ -12,11 +12,14 @@ import time
 import math
 import functools
 import torch.cuda.amp as amp 
-from config import parse_args, set_path
+from config_egoexo4d import parse_args, set_path
 from loss import get_loss, get_mask_from_time, get_text_pos
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 
 sys.path.append('../data/')
-from data.loader_htm import HTM_FeatureLoader, pad_sequence_by_last
+from data.loader_egoexo4d_tan import EgoExo4DDataLoaderTAN
 sys.path.append('../model/')
 from tan_model import TemporalAligner, TwinTemporalAligner
 from word2vec_model import Word2VecTokenizer
@@ -34,9 +37,11 @@ def train(loader, model, optimizer, lr_scheduler, grad_scaler, device, epoch, ar
     batch_time = AverageMeter('Time',':.2f')
     data_time = AverageMeter('Data',':.2f')
     losses = AverageMeter('Loss',':.4f')
-    progress = ProgressMeter(
-        len(loader), [batch_time, data_time, losses],
-        prefix='Epoch:[{}]'.format(epoch))
+    rank = args.rank  # Assuming rank is passed in args
+    if rank == 0:
+        progress = ProgressMeter(
+            len(loader), [batch_time, data_time, losses],
+            prefix='Epoch:[{}]'.format(epoch))
     model.train()
 
     end = time.time()
@@ -47,24 +52,13 @@ def train(loader, model, optimizer, lr_scheduler, grad_scaler, device, epoch, ar
         data_time.update(time.time() - end)
         video_seq = input_data['video'].to(device, non_blocking=True)
         video_padding_mask = input_data['padding_mask'].to(device, non_blocking=True)
+        text_embed = input_data['video'].to(device, non_blocking=True)
+        text_padding_mask = input_data['padding_mask'].to(device, non_blocking=True)
 
-        # get text embedding
-        num_sentence_per_sample = [i.shape[0] for i in input_data['token']]
-        token_list = [i.to(device,non_blocking=True) for i in input_data['token']]
-        flatten_sentence_token = torch.concat(token_list, 0)
-        
-        # get per-sentence feature
-        flatten_sentence_token = flatten_sentence_token.long()
-        text_embed = model.lang_model(input_ids=flatten_sentence_token,
-                                attention_mask=flatten_sentence_token!=0)
-        text_embed = text_embed['pooler_output']
-        text_embed = pad_sequence_by_last(torch.split(text_embed, num_sentence_per_sample, dim=0))
-        text_padding_mask = pad_sequence(torch.split(
-            torch.zeros(flatten_sentence_token.shape[0], device=device),
-            num_sentence_per_sample, dim=0), 
-            batch_first=True, padding_value=1)
 
         # get text timestamp for training
+        print(f"VIDEO SEQ SHAPE: {video_seq.shape}")
+        print(f"TEXT EMBED SHAPE: {text_embed.shape}")
         B, T, _ = video_seq.shape
         N = text_embed.shape[1]
 
@@ -122,10 +116,10 @@ def train(loader, model, optimizer, lr_scheduler, grad_scaler, device, epoch, ar
                 model._momentum_update()
 
         # log stats
-        if args.iteration % 5 == 0:
+        if rank == 0 and args.iteration % 5 == 0:
             for k, v in loss_dict.items():
-                args.train_plotter.add_data(f'local/{k}', v.item(), args.iteration)
-            args.train_plotter.add_data('local/lr', lr_scheduler.get_last_lr()[0], args.iteration)
+                args.train_plotter.add_data(f'train/{k}', v.item(), args.iteration)
+            args.train_plotter.add_data('train/lr', lr_scheduler.get_last_lr()[0], args.iteration)
             args.train_plotter.add_data('device/sps', 1/(time.time()-end), args.iteration)
             args.train_plotter.log_gpustat(step=args.iteration)
             args.train_plotter.writer.flush()
@@ -134,31 +128,32 @@ def train(loader, model, optimizer, lr_scheduler, grad_scaler, device, epoch, ar
             args.prof.step()
 
         batch_time.update(time.time() - end)
-        progress.display(idx)
+        if rank == 0:
+            progress.display(idx)
         lr_scheduler.step(args.iteration)
         end = time.time()
         args.iteration += 1
 
-        # save runtime ckpt (for long-schedule training)
-        if args.iteration % args.runtime_save_iter == 0:
-            print('saving runtime checkpoint ...')
-            state_dict = model.state_dict()
-            save_dict = {
-                'epoch': epoch,
-                'state_dict': state_dict,
-                'best_acc': 1e5,
-                'optimizer': optimizer.state_dict(),
-                'iteration': args.iteration}
-            save_runtime_checkpoint(save_dict, 
-                filename=os.path.join(args.model_path, 'runtime.pth.tar'))
-
-            metric_dict = evaluate_downstream(model, device, args)
-            for k, v in metric_dict.items():
-                args.train_plotter.add_data(f'local/{k}', v.item(), args.iteration)
-            model.train()
-
-    print(f'epoch {epoch} finished, takes {time.time() - tic} seconds')
-    args.train_plotter.add_data('global/loss', losses.avg, epoch)
+        if rank == 0:
+            # save runtime ckpt (for long-schedule training)
+            if args.iteration % args.runtime_save_iter == 0:
+                print('saving runtime checkpoint ...')
+                state_dict = model.state_dict()
+                save_dict = {
+                    'epoch': epoch,
+                    'state_dict': state_dict,
+                    'best_acc': 1e5,
+                    'optimizer': optimizer.state_dict(),
+                    'iteration': args.iteration}
+                save_runtime_checkpoint(save_dict, 
+                    filename=os.path.join(args.model_path, 'runtime.pth.tar'))
+        metric_dict = evaluate_downstream(model, device, args)
+        for k, v in metric_dict.items():
+            args.train_plotter.add_data(f'local/{k}', v.item(), args.iteration)
+        model.train()
+    if rank == 0:
+        print(f'epoch {epoch} finished, takes {time.time() - tic} seconds')
+        args.train_plotter.add_data('global/loss', losses.avg, epoch)
     return losses.avg
 
 
@@ -253,21 +248,22 @@ def inference_htm(model, device, args):
     
 
 def setup(args):
-    # DDP setting (not using DDP in our exp)
+    # Initialize distributed environment
     args.distributed = int(os.environ.get('SLURM_JOB_NUM_NODES', "1")) > 1
-
+    if args.distributed:
+        torch.distributed.init_process_group(backend='nccl')
+        args.rank = torch.distributed.get_rank()
+        args.world_size = torch.distributed.get_world_size()
+        torch.cuda.set_device(args.rank)
+        device = torch.device(f'cuda:{args.rank}')
+    else:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     # CUDA setting
     if torch.cuda.is_available():
-        if args.gpu is None:
-            args.gpu = str(os.environ["CUDA_VISIBLE_DEVICES"])
-        else:
-            os.environ["CUDA_VISIBLE_DEVICES"]=str(args.gpu)
-        device = torch.device('cuda')
-
-        num_gpu = len(str(args.gpu).split(','))
+        num_gpu = torch.cuda.device_count()
         args.num_gpu = num_gpu
-        args.batch_size = num_gpu * args.batch_size
-        print('=> Effective BatchSize = %d' % args.batch_size)
+        if args.rank == 0:
+            print('=> Effective BatchSize = %d' % args.batch_size)
     else:
         args.num_gpu = 0
         device = torch.device('cpu')
@@ -284,40 +280,64 @@ def setup(args):
     # tensorboard monitor in the background threads
     writer_train = SummaryWriter(logdir=os.path.join(args.log_path, 'train'), flush_secs=60)
     args.train_plotter = TB.PlotterThread(writer_train)
-    writer_val = SummaryWriter(logdir=os.path.join(args.log_path, 'val'), flush_secs=60)
-    args.val_plotter = TB.PlotterThread(writer_val)
 
     # language tokenizer
-    if args.language_model == 'bert':
-        args.tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
-    elif args.language_model == 'word2vec':
-        args.tokenizer = Word2VecTokenizer()
     return device
 
-
 def get_dataset(args):
-    tokenizer = args.tokenizer
-    D = HTM_FeatureLoader
+    D = EgoExo4DDataLoaderTAN
     train_dataset = D(
-        text_tag=args.dataset,
-        tokenizer=tokenizer,
-        mode='train',
-        duration=args.seq_len)
+        split="train",
+        duration=args.seq_len,
+        hop_length=args.seq_hop,
+        use_audio=args.use_audio,
+        use_keysteps=args.use_keysteps,
+        views=args.views,
+        use_distill_nce_loss=args.use_distill_nce_loss,
+        use_center_duration=args.use_center_duration,
+        multi_view_egoexo=args.multi_view_egoexo,
+        num_max_views=args.num_max_views,
+        randomize_narration_order=args.randomize_narration_order,
+        curriculum_train=args.curriculum_train,
+        sorted_curr_train=args.sorted_curr_train,
+        stitched_best_exo_distill=args.stitched_best_exo_distill,
+        model=args.model,
+        exo_mode=args.exos,
+        minimum_four_exo_takes=args.minimum_four_exo_takes,
+        same_view_negative=args.same_view_negative,
+        use_tf_video_features=args.use_tf_video_features,
+        tokenizer=None)
     val_dataset = D(
-        text_tag=args.dataset,
-        tokenizer=tokenizer,
-        mode='val',
-        duration=args.seq_len)
+        split="val",
+        duration=args.seq_len,
+        hop_length=args.seq_hop,
+        use_audio=args.use_audio,
+        use_keysteps=args.use_keysteps,
+        views="exo" if args.model in ['grounding', 'joint'] else "all",
+        use_distill_nce_loss=args.use_distill_nce_loss,
+        use_center_duration=args.use_center_duration,
+        multi_view_single_exo_inference=(args.views=="multi"),
+        multi_view_egoexo=args.multi_view_egoexo,
+        num_max_views=args.num_max_views,
+        stitched_best_exo_distill=True if args.model in ['view_invariant'] else False, #TODO: Is this right??? Should we be fixing best_exo_distill in VI evaluation?
+        model=args.model,
+        randomize_narration_order=False,
+        minimum_four_exo_takes=args.minimum_four_exo_takes,
+        same_view_negative=args.same_view_negative,
+        use_tf_video_features=args.use_tf_video_features,
+        tokenizer=None)
 
-    train_sampler = data.RandomSampler(train_dataset)
-    val_sampler = data.SequentialSampler(val_dataset) 
+    train_sampler = DistributedSampler(train_dataset, num_replicas=args.world_size, rank=args.rank)
+    val_sampler = DistributedSampler(val_dataset, num_replicas=args.world_size, rank=args.rank) 
 
+    print("Loading train dataset...")
     train_loader = DataLoaderBG(train_dataset,
         batch_size=args.batch_size, num_workers=args.num_workers,
         collate_fn=train_dataset.collate_fn, pin_memory=True, drop_last=True,
         shuffle=(train_sampler is None), sampler=train_sampler, 
     )
 
+    print("Loading val dataset...")
     val_loader = DataLoaderBG(val_dataset,
         batch_size=args.batch_size, num_workers=args.num_workers,
         collate_fn=val_dataset.collate_fn, pin_memory=True, drop_last=False,
@@ -357,12 +377,12 @@ def optim_policy(model, args, policy='default'):
 
 
 def main(args):
+    device = setup(args)
+    rank = args.rank
     # pre-setup: overwritting
     if args.model == 'cotrain':
         args.learn_agreement = True
         args.use_alignability_head = True
-
-    device = setup(args)
     if not args.test:
         _, val_dataset, train_loader, val_loader = get_dataset(args)
 
@@ -390,13 +410,14 @@ def main(args):
         )
 
     model.to(device)
+    model = DDP(model, device_ids=[rank], find_unused_parameters=args.model in ['init'])  # Wrap model with DDP
     model_without_dp = model
 
     ### optimizer ###
     params = optim_policy(model, args, args.optim_policy)
     optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.wd)
 
-    if not args.test:
+    if not args.test and rank == 0:
         print('\n===========Check Grad============')
         for name, param in model.named_parameters():
             if param.requires_grad:
@@ -405,32 +426,25 @@ def main(args):
 
     ### test ###
     if args.test:
-        print('### test on downstream tasks ###')
-        if args.test.lower() == 'random':
-            print("[Warning] testing random weights")
-        else:
+        if rank == 0:
             args.test = get_model_card(args.test)
-            checkpoint = torch.load(args.test, map_location='cpu')
-            state_dict = checkpoint['state_dict']
-            epoch = checkpoint['epoch']
-            try:
-                model_without_dp.load_state_dict(state_dict)
-            except:
-                model_without_dp.load_state_dict(state_dict, strict=False)
+            print(f"Loading model from {args.test} for testing...")
+        checkpoint = torch.load(args.test, map_location='cpu')
+        state_dict = checkpoint['state_dict']
+        epoch = checkpoint['epoch']
+        try:
+            model_without_dp.load_state_dict(state_dict)
+        except:
+            model_without_dp.load_state_dict(state_dict, strict=False)
+            if rank == 0:
                 print('[WARNING] Non-Equal load for testing!')
 
         model.eval()
 
-        if args.inference:
+        if rank == 0:
             print('Start Inference ...')
             inference_htm(model, device, args)
-            sys.exit(0)
-        
-        args.downstream = 1
-        if args.downstream:
-            metric_dict = evaluate_downstream(model, device, args)
-        else:
-            val_loss = evaluate(val_loader, model, device, epoch, args)
+        dist.barrier()
         sys.exit(0)
 
     ### restart ###
@@ -506,10 +520,12 @@ def main(args):
     for epoch in range(args.start_epoch, args.epochs):
         np.random.seed(epoch)
         random.seed(epoch)
+        if args.distributed:
+            dist.barrier()
         train_loss = train(train_loader, model, optimizer, lr_scheduler, grad_scaler, device, epoch, args)
         _ = evaluate(val_loader, model, device, epoch, args)
 
-        if (epoch % args.eval_freq == 0) or (epoch == args.epochs - 1):
+        if rank == 0 and (epoch % args.eval_freq == 0) or (epoch == args.epochs - 1):
             is_best = train_loss < best_acc  # temporary use val loss
             best_acc = min(train_loss, best_acc)
             state_dict = model_without_dp.state_dict()
@@ -522,8 +538,9 @@ def main(args):
             save_checkpoint(save_dict, is_best, args.eval_freq, 
                 filename=os.path.join(args.model_path, 'epoch%d.pth.tar' % epoch), 
                 keep_all=(args.model in ['cotrain']),)
-
-    print('Training from ep %d to ep %d finished' % (args.start_epoch, args.epochs))
+    if rank == 0:
+        print('Training from ep %d to ep %d finished' % (args.start_epoch, args.epochs))
+    dist.destroy_process_group()
     sys.exit(0)
 
 
@@ -535,8 +552,10 @@ def get_model_card(tag):
     return model_card_dict.get(tag, tag)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     args = parse_args()
+    args.rank = int(os.environ['RANK'])
+    args.world_size = int(os.environ['WORLD_SIZE'])
     main(args)
 
 """

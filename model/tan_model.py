@@ -34,19 +34,13 @@ class TemporalAligner(nn.Module):
         self.random_pos_start = random_pos_start
         self.use_alignability_head = use_alignability_head
 
-        if language_model == 'bert':
-            self.bert = BertModel.from_pretrained('bert-base-uncased')
-        elif language_model == 'word2vec':
-            self.bert = Word2VecModel()
-        text_embed_dim = {'bert': 768, 'word2vec': 512}
-
         self.video_temporal_encoder = TemporalEncoder(
             width=512, layers=num_encoder_layers, heads=8)
         self.joint_temporal_encoder = TemporalEncoder(
             width=512, layers=num_decoder_layers, heads=8)
 
-        self.video_pre_proj = nn.Linear(1024, 512, bias=False)
-        self.text_pre_proj = nn.Linear(text_embed_dim[language_model], 512, bias=False)
+        self.video_pre_proj = nn.Linear(4096, 512, bias=False)
+        self.text_pre_proj = nn.Linear(4096, 512, bias=False)
         self.ln_text_init = LayerNorm(512)
         self.ln_video_init = LayerNorm(512)
         self.ln_position_init = LayerNorm(512)
@@ -55,14 +49,14 @@ class TemporalAligner(nn.Module):
         
         # temporal positional encoding for video
         if self.pos_enc == 'learned':
-            self.temporal_pos_embed = nn.Parameter(torch.empty(1024, 512))
+            self.temporal_pos_embed = nn.Parameter(torch.empty(4096, 512))
             nn.init.normal_(self.temporal_pos_embed, std=0.01)
         elif self.pos_enc == 'sine':
-            temporal_pos_embed = get_position_embedding_sine(512, 1024)
+            temporal_pos_embed = get_position_embedding_sine(512, 4096)
             self.register_buffer('temporal_pos_embed', temporal_pos_embed)
 
         # temporal positional encoding for text
-        self.text_temporal_pos_embed = nn.Parameter(torch.empty(1024, 512))
+        self.text_temporal_pos_embed = nn.Parameter(torch.empty(4096, 512))
         nn.init.normal_(self.text_temporal_pos_embed, std=0.01)
 
         self.mlp = nn.Linear(512, 512)

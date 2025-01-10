@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=jnt_trn
-#SBATCH --output=/checkpoint/%u/slurm_logs/exoground/train_joint_%j.out
-#SBATCH --error=/checkpoint/%u/slurm_logs/exoground/train_joint_%j.out
+#SBATCH --output=/checkpoint/%u/slurm_logs/joint/train_joint_%j.out
+#SBATCH --error=/checkpoint/%u/slurm_logs/joint/train_joint_%j.out
 #SBATCH --partition=learnfair
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
@@ -32,6 +32,7 @@ srun --label torchrun --nproc_per_node=8 \
     --minimum_four_exo_takes \
     --use_distill_nce_loss \
     --same_view_negative \
+    --reverse_ranking \
     --name_prefix $1
 
 # --same_view_negative \
@@ -39,4 +40,17 @@ srun --label torchrun --nproc_per_node=8 \
 ### --curriculum_train \
 ### --start_frac 0.1 \
 ### --end_epoch_frac 0.5 \
-### --stitched_best_exo_distill \ #Doesn't do anything anymore, we are always stitching
+### --final_phase_prop 0.5 \
+### --sorted_curr_train ("phased": cycle the positive features, "sorted": sort the training data, don't cycle the positive)
+
+#CURR TRAIN:
+    # --curriculum_train \
+    # --start_frac 0.75 \
+    # --end_epoch_frac 0.5 \
+    # --sorted_curr_train sorted \
+
+# --use_tf_video_features \
+
+    # --use_distill_nce_loss \
+    # --same_view_negative \
+    # --only_same_view_negative \

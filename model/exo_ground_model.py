@@ -176,11 +176,15 @@ class ExoGroundingTransformer(nn.Module):
             # Directly use text features from encoder output for grounding
             grounding = self.grounding_head(text_features)
 
-        output_dict = {'interval_preds': grounding}
+        output_dict = {'interval_preds': grounding, 'low_dim_features': video_encoded_features}
         if self.use_distill_nce_loss or self.use_pairwise_distill_nce_loss:
             output_dict['high_dim_features'] = exo_features_projected
-        #    output_dict['distill_infonce_loss'] = distill_loss
 
+        return output_dict
+
+    def get_low_dim_target_features(self, video_embed, video_padding_mask):
+        video_encoded_features = self.get_unimodal_features("video", video_embed, video_padding_mask).mean(dim=1)
+        output_dict = {'low_dim_features': video_encoded_features}
         return output_dict
 
     def add_positional_encoding(self, embed, interpolate_from=None):

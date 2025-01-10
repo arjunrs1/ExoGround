@@ -164,7 +164,7 @@ def get_view_invariant_loss(input_data, logits, args):
         same_view_neg_idxs = None
         same_view_features = None
 
-    info_nce_losses = compute_info_nce_loss_cross_view(features, ego_seq, positive_feature_idxs, negative_feature_idxs, same_view_neg_idxs, same_view_features)
+    info_nce_losses = compute_info_nce_loss_cross_view(features, ego_seq, positive_feature_idxs, negative_feature_idxs, same_view_neg_idxs, same_view_features, only_same_view_negative=args.only_same_view_negative)
     l1_losses, pos_cos_sim, avg_neg_cos_sim = compute_l1_cosine_losses(features, ego_seq, positive_feature_idxs, negative_feature_idxs)
 
     flat_view_rank_names = flatten_list_of_lists(view_rank_names)
@@ -266,7 +266,7 @@ def compute_info_nce_loss_cross_view_OLD(output_features, video_features, positi
     #nce_loss = -log_prob_positive.mean()
     return -log_prob_positive
 
-def compute_info_nce_loss_cross_view(output_features, video_features, positive_indices, negative_indices, same_view_neg_idxs=None, same_view_features=None, temperature=0.1):
+def compute_info_nce_loss_cross_view(output_features, video_features, positive_indices, negative_indices, same_view_neg_idxs=None, same_view_features=None, only_same_view_negative=False, temperature=0.1):
     """
     Compute the InfoNCE loss using positive and negative indices.
     Args:
@@ -308,7 +308,10 @@ def compute_info_nce_loss_cross_view(output_features, video_features, positive_i
         )
         same_view_negative_features_normalized = F.normalize(same_view_negative_features, p=2, dim=2)
         same_view_neg_similarities = (output_features_normalized * same_view_negative_features_normalized).sum(dim=2) / temperature
-        similarities = torch.cat([pos_similarities.unsqueeze(2), neg_similarities.unsqueeze(2), same_view_neg_similarities.unsqueeze(2)], dim=2)
+        if only_same_view_negative:
+            similarities = torch.cat([pos_similarities.unsqueeze(2), same_view_neg_similarities.unsqueeze(2)], dim=2)
+        else:
+            similarities = torch.cat([pos_similarities.unsqueeze(2), neg_similarities.unsqueeze(2), same_view_neg_similarities.unsqueeze(2)], dim=2)
     else:
         similarities = torch.cat([pos_similarities.unsqueeze(2), neg_similarities.unsqueeze(2)], dim=2)
     # Compute log probabilities
@@ -365,12 +368,14 @@ def visualize(input_data, logits, args, epoch):
     exo_cameras = input_data['metadata']['exo_camera']
     start_secs = input_data['metadata']['start_sec']
     
-    text_padding_mask = input_data['narration_padding_mask'].cpu().numpy()
-    grounding_preds = logits['interval_preds'].cpu().numpy()
+    grounding_preds = logits['interval_preds']#.cpu().numpy()
+    device = grounding_preds.device
+    text_padding_mask = input_data['narration_padding_mask'].to(device, non_blocking=True)#.cpu().numpy()
+    
     
     if args.use_center_duration:
-        centers_gt = input_data['mean'].cpu().numpy()
-        durations_gt = input_data['duration'].cpu().numpy()
+        centers_gt = input_data['mean'].to(device, non_blocking=True)#.cpu().numpy()
+        durations_gt = input_data['duration'].to(device, non_blocking=True)#.cpu().numpy()
         gt_starts = centers_gt - durations_gt / 2
         gt_ends = centers_gt + durations_gt / 2
 
@@ -378,15 +383,35 @@ def visualize(input_data, logits, args, epoch):
         durations_pred = grounding_preds[:, :, 1]
         pred_starts = centers_pred - durations_pred / 2
         pred_ends = centers_pred + durations_pred / 2
+
+        centers_gt_trunc = centers_gt[~text_padding_mask]
+        durations_gt_trunc = durations_gt[~text_padding_mask]
+        centers_pred_trunc = centers_pred[~text_padding_mask]
+        durations_pred_trunc = durations_pred[~text_padding_mask]
+
+        starts_pred_trunc = centers_pred_trunc - durations_pred_trunc / 2
+        ends_pred_trunc = centers_pred_trunc + durations_pred_trunc / 2
+        starts_gt_trunc = centers_gt_trunc - durations_gt_trunc / 2
+        ends_gt_trunc = centers_gt_trunc + durations_gt_trunc / 2
     else:
-        gt_starts = input_data['starts'].cpu().numpy()
-        gt_ends = input_data['ends'].cpu().numpy()
+        gt_starts = input_data['starts']#.cpu().numpy()
+        gt_ends = input_data['ends']#.cpu().numpy()
         pred_starts = grounding_preds[:, :, 0]
         pred_ends = grounding_preds[:, :, 1]
 
+    intersection = torch.clamp(torch.min(ends_pred_trunc, ends_gt_trunc) - torch.max(starts_pred_trunc, starts_gt_trunc), min=0)
+    union = torch.max(ends_pred_trunc, ends_gt_trunc) - torch.min(starts_pred_trunc, starts_gt_trunc)
+    ious = intersection / (union + args.iou_loss_eps)
+    ious = ious.cpu().numpy()
+
+    text_padding_mask = text_padding_mask.cpu().numpy()
+    grounding_preds = grounding_preds.cpu().numpy()
+
     base_video_path = "/datasets01/egoexo4d/v2/takes/"
+    test_epoch_num = args.test.split(".pth")[0].split("h")[-1]
+    assert test_epoch_num.isdigit()
     video_count = 0
-    for take_id, exo_cam, start_sec, pred_start, pred_end, gt_start, gt_end, narrs, pad_mask in zip(take_ids, exo_cameras, start_secs, pred_starts, pred_ends, gt_starts, gt_ends, sentences, text_padding_mask):
+    for take_id, exo_cam, start_sec, pred_start, pred_end, gt_start, gt_end, narrs, pad_mask, iou in zip(take_ids, exo_cameras, start_secs, pred_starts, pred_ends, gt_starts, gt_ends, sentences, text_padding_mask, ious):
         if video_count >= min(args.visualization_videos_per_epoch, len(take_ids)):
             break
         video_path = os.path.join(base_video_path, take_id, "frame_aligned_videos", "downscaled", "448", f"{exo_cam}.mp4")
@@ -400,12 +425,12 @@ def visualize(input_data, logits, args, epoch):
         cap_pred.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
         cap_gt.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
         
-        vis_dir = os.path.join(args.log_path, "visualization")
+        vis_dir = os.path.join(args.log_path, "visualization", test_epoch_num)
         if not os.path.isdir(vis_dir):
             os.makedirs(vis_dir)
 
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        video_out_path = os.path.join(vis_dir, f'epoch={epoch}_{take_id}_{exo_cam}_start={start_sec}_duration={args.seq_len}.mp4')
+        video_out_path = os.path.join(vis_dir, f'IoU={iou}_{take_id}_{exo_cam}_start={start_sec}.mp4')
         out = cv2.VideoWriter(video_out_path, fourcc, fps, (int(cap_pred.get(3)) * 2, int(cap_pred.get(4))))
         
         current_frame = start_frame
@@ -416,8 +441,12 @@ def visualize(input_data, logits, args, epoch):
                 break
             
             # Annotate predicted and ground truth frames
-            frame_pred = annotate_frame(frame_pred, narrs, pred_start, pred_end, pad_mask, current_frame, start_frame, fps, args.seq_len, "P")
-            frame_gt = annotate_frame(frame_gt, narrs, gt_start, gt_end, pad_mask, current_frame, start_frame, fps, args.seq_len, "GT")
+            if ("PX" in args.test) or ("svn" in args.test) or ("joint_nodist" in args.test):
+                frame_pred = annotate_frame(frame_pred, narrs, pred_start, pred_end, pad_mask, current_frame, start_frame, fps, args.seq_len, "P")
+                frame_gt = annotate_frame(frame_gt, narrs, gt_start, gt_end, pad_mask, current_frame, start_frame, fps, args.seq_len, "GT")
+            else:
+                frame_pred = annotate_frame(frame_pred, narrs, pred_start, pred_end, pad_mask, current_frame, start_frame, fps, args.seq_len, "P")
+                frame_gt = annotate_frame(frame_gt, narrs, gt_start, gt_end, pad_mask, current_frame, start_frame, fps, args.seq_len, "GT")
             
             # Stitch frames side by side
             combined_frame = np.hstack((frame_pred, frame_gt))
@@ -432,7 +461,7 @@ def visualize(input_data, logits, args, epoch):
         video_count += 1
         print(f"Generating epoch {epoch} dual video: {video_out_path}...")
 
-def annotate_frame(frame, narrs, starts, ends, pad_mask, current_frame, start_frame, fps, seq_len, label):
+def annotate_frame_OLD(frame, narrs, starts, ends, pad_mask, current_frame, start_frame, fps, seq_len, label):
     font = cv2.FONT_HERSHEY_SIMPLEX
     font_scale = 0.5
     color = (255, 255, 255)  # White color for text
@@ -463,59 +492,76 @@ def annotate_frame(frame, narrs, starts, ends, pad_mask, current_frame, start_fr
 
     return frame
 
-""" def get_grounding_loss(input_data, 
-             text_embed, logits, args, abs_text_pos):
+def annotate_frame(frame, narrs, starts, ends, pad_mask, current_frame, start_frame, fps, seq_len, label):
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.5
+    color = (255, 255, 255)  # White color for text
     
-    logits_joint = logits['logits_joint']
-    ego_seq = input_data['ego_video_features'].to(device, non_blocking=True)
-    text_padding_mask = input_data['text_padding_mask'].to(device, non_blocking=True)
+    # Loop through each narration and its corresponding start and end times
+    for i in range(len(starts)):
+        if pad_mask[i] == 1:
+            continue
+        
+        # Convert relative start and end times to frame numbers
+        start_frame_num = int(starts[i] * seq_len * fps) + start_frame
+        end_frame_num = int(ends[i] * seq_len * fps) + start_frame
+        
+        # Check if the current frame is within the interval
+        if start_frame_num <= current_frame < end_frame_num:
+            narr = narrs[i]
+            
+            # Calculate the position of the text on the frame
+            x = 10
+            y = 20  # Fixed position for a single narration
+            
+            # Draw a background rectangle for better text visibility
+            text_size = cv2.getTextSize(f"{label}: {narr}", font, font_scale, 1)[0]
+            cv2.rectangle(frame, (x, y - text_size[1] - 2), (x + text_size[0], y + 2), color, -1)
+            
+            # Draw the text on the frame
+            cv2.putText(frame, f"{label}: {narr}", (x, y), font, font_scale, (0, 0, 0), 1)  # Black text
+            
+            # Break after adding the first valid narration
+            break
 
-    if args.sim == 'cos':
-        logits_joint = logits_joint / 0.07
+    return frame
 
-    device = logits_joint.device
-    B, T, _ = ego_seq.shape
-    N = text_embed.shape[1]
-    num_joint_layers = logits_joint.shape[1]
 
-    loss_dict = {}
-
-    # binary tgt: B,T,B,N
-    binary_tgt_raw, _, _ = get_mask_from_time(
-        input_data['start'], input_data['end'],
-        num_timestamp=T, num_text=N, device=device)  # B,N,T
-    binary_tgt = rearrange(binary_tgt_raw, 'b n t -> b t n').unsqueeze(2).repeat(1,1,B,1) * torch.eye(
-        B, device=device)[:,None,:,None]
-    flatten_text = np.array([item for sublist in input_data['text'] for item in sublist])
-
-    ### prepare tgt ###
-    no_padding_binary_tgt = binary_tgt[:,:,~text_padding_mask.bool()]
-    no_padding_binary_tgt = no_padding_binary_tgt.view(B*T,-1)
-    video_mask_with_pos = no_padding_binary_tgt.sum(-1) > 0
-    text_mask_with_pos = no_padding_binary_tgt.sum(-2) > 0
-
-    ### get logits for joint model ###
-    no_padding_logits_joint = logits_joint[:,:,:,~text_padding_mask.bool()]
-    no_padding_logits_joint = no_padding_logits_joint.permute(1,0,2,3).reshape(num_joint_layers, B*T, -1)
-    no_padding_logits_joint_pos = no_padding_logits_joint.clone()
-    no_padding_logits_joint_pos[:,~no_padding_binary_tgt.bool()] = - 6e4
-
-    v_numerator_joint = torch.logsumexp(no_padding_logits_joint_pos, dim=-1)
-    v_denomenator_joint = torch.logsumexp(no_padding_logits_joint, dim=-1)
-    v_loss_milnce_joint = (v_denomenator_joint - v_numerator_joint)[:,video_mask_with_pos.bool()]
-    
-    t_numerator_joint = torch.logsumexp(no_padding_logits_joint_pos, dim=-2)
-    t_denomenator_joint = torch.logsumexp(no_padding_logits_joint, dim=-2)
-    t_loss_milnce_joint = (t_denomenator_joint - t_numerator_joint)[:,text_mask_with_pos.bool()]
-
-    loss_joint = (v_loss_milnce_joint.mean() + t_loss_milnce_joint.mean()) / 2
-    loss_dict['loss-joint'] = loss_joint.detach()
-    
-    ### compute the final loss ###
-    bce_weight = 1
-    nce_weight = 0 if args.optim_policy == 'bce' else 1 
-
-    loss = loss_joint
-    loss_dict['loss'] = loss
-
-    return loss_dict """
+def save_features_to_dir(input_data, logits, args, epoch, low_dim_target_features=None):
+    # Define the base directory for saving features
+    base_dir = os.path.join(args.log_path, "saved_features")
+    try:
+        os.makedirs(base_dir, exist_ok=True)
+    except OSError as e:
+        logging.error(f"Error creating base directory: {e}")
+        return
+    # Extract metadata
+    take_ids = input_data['metadata']['video_id']
+    exo_cameras = input_data['metadata']['exo_camera']
+    start_secs = input_data['metadata']['start_sec']
+    # Extract features
+    #input_features = input_data['video_features'].cpu().numpy()
+    output_features = logits['low_dim_features'].cpu().numpy()
+    if low_dim_target_features is not None:
+        print(low_dim_target_features)
+        ego_seq = low_dim_target_features.cpu().numpy()
+        positive_feature_idxs = input_data['view_rank_label'].cpu().numpy()
+    # Iterate over each sample in the batch
+    for i, (take_id, exo_cam, start_sec) in enumerate(zip(take_ids, exo_cameras, start_secs)):
+        # Create a directory for each video take
+        features_dir = os.path.join(base_dir, take_id, exo_cam, str(start_sec))
+        try:
+            os.makedirs(features_dir, exist_ok=True)
+        except OSError as e:
+            logging.error(f"Error creating features directory: {e}")
+            continue
+        # Save input features
+        #np.save(os.path.join(features_dir, f"input_features.npy"), input_features[i])
+        # Save output features
+        np.save(os.path.join(features_dir, f"output_features.npy"), output_features[i])
+        
+        if low_dim_target_features is not None:
+            # Save ego sequence
+            np.save(os.path.join(features_dir, f"ego_seq.npy"), ego_seq[i])
+            # Save positive feature indices
+            np.save(os.path.join(features_dir, f"positive_feature_idxs_epoch.npy"), positive_feature_idxs[i])

@@ -42,6 +42,7 @@ srun --label torchrun --nproc_per_node=8 \
     --exos all \
     --model grounding \
     --use_egovlp_features \
+    --same_
     --test /private/home/arjunrs1/exo_narration_grounding/ExoGround/train/log/egovlp_g_2024_10_22_23_14_grounding_iou_l1_egoexo4d_len64_e6d6_bs16_lr0.0001_view=all_distill=False_pair_ds=False_pair_ds_mode=all_multi_ego=False_narr_rand=False/model/model_best_epoch45.pth.tar \
     --name_prefix $1
 

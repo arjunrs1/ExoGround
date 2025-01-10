@@ -171,7 +171,6 @@ class HTM_FeatureLoader():
             output_dict = {**output_dict, 'cut_start': start_timestamp, 'cut_end': end_timestamp}
         return output_dict
 
-
     def _get_text(self, vid, vlen):
         if self.text_tag in ['htm-370k', 'htm-1200k']:
             cap_df = pd.DataFrame.from_dict(self.vid_to_asr_dict[vid])

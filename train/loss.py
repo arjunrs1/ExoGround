@@ -37,6 +37,8 @@ def get_mask_from_time(start_list, end_list, num_timestamp, num_text, device='cu
         [torch.FloatTensor(i) for i in end_list],
         batch_first=True, 
         padding_value=-1e2).to(device, non_blocking=True)
+    print(start_list.shape)
+    print(end_list.shape)
     mask = (start_list[:,:,None] <= steps) * (steps < end_list[:,:,None]) 
     return mask, start_list, end_list
 
@@ -72,6 +74,7 @@ def get_loss(input_data,
     device = logits_dual.device
     B, T, _ = video_seq.shape
     N = text_embed.shape[1]
+    print(f"text embed shape: {text_embed.shape}")
     num_enc_layers = logits_dual.shape[1]
     num_joint_layers = logits_joint.shape[1]
 

@@ -8,11 +8,13 @@ def parse_args():
     parser.add_argument('--seed', default=888,type=int)
     parser.add_argument('--model', default='init', choices=['init', 'cotrain'], type=str)
     parser.add_argument('--language_model', default='word2vec', type=str)
-    parser.add_argument('--dataset', default='htm-fe', type=str)
+    parser.add_argument('--dataset', default='egoexo4d', type=str)
     parser.add_argument('--seq_len', default=64, type=int)
+    parser.add_argument('--seq_hop', default=5, type=int)
     parser.add_argument('--batch_size', default=64, type=int)
     parser.add_argument('--loss', default='nce', type=str)
     parser.add_argument('--lr', default=1e-4, type=float)
+    parser.add_argument('--iou_loss_eps', default=1e-8, type=float)
     parser.add_argument('--wd', default=1e-5, type=float)
     parser.add_argument('--clip_grad', default=0.0, type=float) # 0.0 or 3.0
     parser.add_argument('--gpu', default=None, type=str)
@@ -25,9 +27,10 @@ def parse_args():
     parser.add_argument('--start_epoch', default=0, type=int)
 
     parser.add_argument('--name_prefix', default='', type=str)
-    parser.add_argument('--prefix', default='tmp', type=str)
+    parser.add_argument('--prefix', default='', type=str)
     parser.add_argument('--backprop_freq', default=1, type=int)
     parser.add_argument('--eval_freq', default=1, type=int)
+    parser.add_argument('--print_freq', default=1, type=int)
     parser.add_argument('--runtime_save_iter', default=1000, type=int)
     parser.add_argument('--optim_policy', default='default', type=str)
 
@@ -40,6 +43,8 @@ def parse_args():
     parser.add_argument('--temporal_agreement_type', default='keep', type=str)
     parser.add_argument('--use_alignability_head', default=0, type=int)
     parser.add_argument('--momentum_m', default=0.999, type=float)
+    parser.add_argument('--iou_thresholds', nargs='+', type=float, default=[0.1, 0.3, 0.5, 0.7])
+    parser.add_argument('--minimum_four_exo_takes', action='store_true')
 
     # transformer
     parser.add_argument('--hidden_dim', default=256, type=int)
@@ -47,7 +52,6 @@ def parse_args():
     parser.add_argument('--num_decoder_layers', default=6, type=int)
 
     # inference
-    parser.add_argument('--inference', default=0, type=int)
     parser.add_argument('--worker_id', default=None, type=int)
     args = parser.parse_args()
     return args

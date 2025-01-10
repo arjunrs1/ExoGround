@@ -6,7 +6,7 @@ from datetime import datetime
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--seed', default=888,type=int)
-    parser.add_argument('--model', default='joint', choices=['view_invariant', 'grounding', 'joint'], type=str)
+    parser.add_argument('--model', default='joint', choices=['view_invariant', 'grounding', 'joint', 'init'], type=str)
     parser.add_argument('--language_model', default='word2vec', type=str)
     parser.add_argument('--dataset', default='egoexo4d', type=str)
     parser.add_argument('--seq_len', default=64, type=int)
@@ -60,16 +60,20 @@ def parse_args():
     parser.add_argument('--pairwise_distill_mode', default='all', choices=['all', 'unmasked'], type=str)
     parser.add_argument('--use_center_duration', action='store_true', default=True)
     parser.add_argument('--views', default='exo', choices=['exo', 'ego', 'all', 'multi'], type=str)
-    parser.add_argument('--num_max_views', default=6, type=int) #6 for EgoExo4D
+    parser.add_argument('--num_max_views', default=4, type=int) #6 for EgoExo4D
     parser.add_argument('--multi_view_egoexo', action='store_true', default=False)
     parser.add_argument('--randomize_narration_order', action='store_true', default=False)
     parser.add_argument('--final_phase_prop', default=0.3, type=float)
     parser.add_argument('--curriculum_train', action='store_true', default=False)
+    parser.add_argument('--sorted_curr_train', default='phased', choices=['phased', 'sorted'], type=str)
     parser.add_argument('--exos', default='all', type=str) #options: 'all', 'best', 'random', 'worst'
     parser.add_argument('--start_frac', default=0.50, type=float) #percentage of initial data for training (curriculum learning)
     parser.add_argument('--end_epoch_frac', default=0.75, type=float) #percentage of max_epochs by which we should be training on all data (curriculum learning)
     parser.add_argument('--stitched_best_exo_distill', action='store_true', default=False)
     parser.add_argument('--same_view_negative', action='store_true', default=False)
+    parser.add_argument('--only_same_view_negative', action='store_true', default=False)
+    parser.add_argument('--reverse_ranking', action='store_true', default=False)
+    parser.add_argument('--randomize_ranking', action='store_true', default=False)
 
     #data dimensions
     parser.add_argument('--video_feature_dim', default=4096, type=int)
@@ -77,12 +81,14 @@ def parse_args():
     parser.add_argument('--audio_feature_dim', default=2304, type=int)
     parser.add_argument('--feature_dim', default=512, type=int)
     parser.add_argument('--use_egovlp_features', action='store_true', default=False)
+    parser.add_argument('--use_tf_video_features', action='store_true', default=False)
     
     # inference
     parser.add_argument('--worker_id', default=None, type=int)
     parser.add_argument('--visualize', action='store_true', default=False)
+    parser.add_argument('--save_features', action='store_true', default=False)
     parser.add_argument('--vis_freq', default=1, type=int)
-    parser.add_argument('--visualization_videos_per_epoch', default=5, type=int)
+    parser.add_argument('--visualization_videos_per_epoch', default=5000, type=int)
     parser.add_argument('--test_egovlp', action='store_true', default=False)
     parser.add_argument('--vi_encoder_path', default='/private/home/arjunrs1/exo_narration_grounding/ExoGround/train/log/neg_cos_2024_10_18_19_01_view_invariant_iou_l1_egoexo4d_len64_e6d6_bs16_lr0.0001_view=all_distill=True_pair_ds=False_pair_ds_mode=all_multi_ego=False_narr_rand=False/model/epoch99.pth.tar', type=str)
     args = parser.parse_args()

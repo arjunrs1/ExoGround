@@ -10,8 +10,11 @@ import random
 import itertools
 from tqdm import tqdm
 import torch.nn.functional as F
+import sys
+sys.path.append('../model')
+from word2vec_model import Word2VecTokenizer
 
-class EgoExo4DDataLoader(Dataset):
+class EgoExo4DDataLoaderTAN(Dataset):
     def __init__(self,
                 split='train',
                 duration=20,
@@ -33,8 +36,7 @@ class EgoExo4DDataLoader(Dataset):
                 minimum_four_exo_takes=False,
                 same_view_negative=False,
                 use_tf_video_features=False,
-                reverse_ranking=False,
-                randomize_ranking=False,
+                tokenizer=None,
                 fps=30):
         self.split = split
         self.duration = duration
@@ -57,8 +59,7 @@ class EgoExo4DDataLoader(Dataset):
         self.minimum_four_exo_takes = minimum_four_exo_takes
         self.same_view_negative = same_view_negative
         self.use_tf_video_features = use_tf_video_features
-        self.reverse_ranking = reverse_ranking
-        self.randomize_ranking = randomize_ranking
+        self.tokenizer = tokenizer
         self.fps = fps
         self.base_path = '/private/home/arjunrs1/egoexo4d_features'
         self.vid_feat_rel_path = "checkpoint/yalesong/EgoExo4D_EgoVLPv2_arxivC/extracted_features_egovlp2/EgoVLPv2_Pretraining_bs512-lr3e_5-Ep20"
@@ -91,14 +92,8 @@ class EgoExo4DDataLoader(Dataset):
         with open(self.camera_rankings_path, "rb") as f:
             self.camera_rankings = json.load(f)
 
-        with open(self.best_exo_annotations_path, "rb") as f:
-            self.best_exo_annotations = json.load(f)
-
         assert not ((self.views == "ego") and (self.use_distill_nce_loss)) #We cannot train on ego only and distill from ego view simultaneously
 
-        if self.curriculum_train:
-            assert self.exo_mode == "all" # curriculum training only on all views (not best, worst, random)
-            assert self.split == "train"
         if self.split != "train":
             assert self.exo_mode == "all" # for val/testing, ensure we are using all views
 
@@ -107,19 +102,11 @@ class EgoExo4DDataLoader(Dataset):
         else:
             self.annotations = pd.read_csv(self.annotation_path)
         self.split_data = pd.read_csv(self.split_path)
-        if not self.use_tf_video_features:
-            self.video_feature_path = os.path.join(self.base_path, self.vid_feat_rel_path)
-        else:
-            self.video_feature_path = "/checkpoint/arjunrs1/vi_encoder_features/egoexo4d_features_REAL"
+        self.video_feature_path = os.path.join(self.base_path, self.vid_feat_rel_path)
         self.audio_feature_path = os.path.join(self.base_path, 'audio_features', f'{split}')
         self.narration_feature_path = os.path.join(self.base_path, 'narration_features')
         if self.use_keysteps:
             self.narration_feature_path = os.path.join(self.narration_feature_path, "keystep_features")
-        if self.multi_view or self.multi_view_single_exo_inference:
-            if self.multi_view_egoexo:
-                self.view_map = {"aria": 0, "cam01": 1, "gp01": 1, "cam02": 2, "gp02":2, "cam03": 3, "gp03": 3, "cam04": 4, "gp04": 4, "cam05": 5, "gp05": 5, "gp06": 6}
-            else:
-                self.view_map = {"cam01": 0, "gp01": 0, "cam02": 1, "gp02":1, "cam03": 2, "gp03": 2, "cam04": 3, "gp04": 3, "cam05": 4, "gp05": 4, "gp06": 5}
         self.current_phase = 0
         
         self.windows_path = self.base_path
@@ -128,15 +115,7 @@ class EgoExo4DDataLoader(Dataset):
 
         model_prepend_str = "grounding" if self.model in ['grounding', 'joint'] else "view_invariant"
         self.window_csv_path = os.path.join(self.windows_path, f'{model_prepend_str}_{split}_{views}_ks={use_keysteps}_ct={curriculum_train}_exos={exo_mode}_windows.csv')
-        if self.curriculum_train and self.sorted_curr_train in ['sorted']:
-            #TODO: Change how curriculum is done - we are no longer doing this, instead we are just going to use the 2nd best or Nth best as the target on per-feature basis
-            self.windows_cam_distances_path = os.path.join(self.windows_path, f'{model_prepend_str}_{split}_{views}_ks={use_keysteps}_ct={curriculum_train}_cam_dists.csv')
         self.precompute_windows()
-        if self.curriculum_train and self.sorted_curr_train in ['sorted']:
-            self.cam_distances = pd.read_csv(self.windows_cam_distances_path)
-            self.windows['cam_ego_distance'] = self.cam_distances['cam_ego_distance']
-            self.windows.sort_values(by='cam_ego_distance', inplace=True)
-            self.windows.drop(columns=['cam_ego_distance'], inplace=True)
 
     def __len__(self):
         return len(self.windows)
@@ -144,7 +123,7 @@ class EgoExo4DDataLoader(Dataset):
     @staticmethod
     def collate_fn(batch):
         # Exclude 'metadata' from default collation
-        exclusions = ['metadata']
+        exclusions = ['metadata', 'start', 'end']
         batch_rest = [{k: v for k, v in item.items() if k not in exclusions} for item in batch]
         collated_data = default_collate(batch_rest)
         if 'metadata' in exclusions:
@@ -153,79 +132,15 @@ class EgoExo4DDataLoader(Dataset):
             for key in metadata_keys:
                 collated_metadata[key] = [item['metadata'][key] for item in batch]
             collated_data['metadata'] = collated_metadata
+        if 'start' in exclusions:
+            collated_data['start'] = [item['start'] for item in batch]
+        if 'end' in exclusions:    
+            collated_data['end'] = [item['end'] for item in batch]
         return collated_data
 
     def set_phase(self, phase):
         print(f"ENTERING PHASE: {phase}")
         self.current_phase = phase
-
-    def camera_view_order(self, take_uid, cam_list, start_sec, end_sec, full_ego_cam_name, ego_cam_ray_point=0.7):
-        try:
-            take_cam_path = f"/datasets01/egoexo4d/v2/annotations/ego_pose/{self.take_uid_cam_pose_split_map[take_uid]}/camera_pose"
-            with open(os.path.join(take_cam_path, f"{take_uid}.json"), "rb") as f:
-                camera_data = json.load(f)
-        except:
-            print(f"Could not find camera parameters for {take_uid}")
-            assert full_ego_cam_name in cam_list
-            cam_list.remove(full_ego_cam_name)
-            cam_list.insert(0, full_ego_cam_name)
-            sorted_dict = {c: cam_list.index(c) for c in cam_list}
-            return cam_list[::-1], sorted_dict
-
-        cam_positions = []
-        all_cam_labels = []
-        rotations = []
-        frame_idx = int((start_sec + ((end_sec - start_sec) / 2)) * self.fps) #use average frame index in window
-        ego_cam = None
-        for cam, details in camera_data.items():
-            try:
-                if cam.lower().startswith("aria"):
-                    extrinsic = np.array(details['camera_extrinsics'][f"{frame_idx}"])
-                    ego_cam = cam
-                elif (cam.lower().startswith("cam") or cam.lower().startswith("gp")):
-                    extrinsic = np.array(details['camera_extrinsics'])
-                else:
-                    #metadata key should be ignored
-                    continue
-            except:
-                print(f"Could not get parameters for {cam} with take uid {take_uid}")
-                continue
-            extrinsic = np.linalg.inv(np.vstack([extrinsic, [0, 0, 0, 1]]))[:3,:]
-            translation = extrinsic[:, -1]
-            rotation = extrinsic[:, :3]
-
-            cam_positions.append(translation)
-            all_cam_labels.append(cam)
-            rotations.append(rotation)
-
-        cam_positions = np.array(cam_positions)
-        rotations = np.array(rotations)
-        ego_index = all_cam_labels.index(ego_cam)
-
-        # Compute the vector between that point and all the exocentric camera positions
-        point_X_meters = cam_positions[ego_index] + ego_cam_ray_point * np.dot(rotations[ego_index], [0,0,1])
-        vectors_to_exo_cams = point_X_meters - cam_positions
-        orientation_vectors = np.dot(rotations, [0,0,1])
-        # Compute the cosine similarity between each exocentric camera's orientation vector and its vector computed in step (2)
-        cosine_similarities = np.array(F.cosine_similarity(torch.tensor(orientation_vectors), torch.tensor(vectors_to_exo_cams)))
-        # Compute the x-y cosine similarity between each exo camera's viewing orientation and the ego camera's viewing orientation to determine ones in front or behind
-        x_y_cosine_similarities = np.dot(orientation_vectors[:, :2], orientation_vectors[ego_index, :2]) / (
-            np.linalg.norm(orientation_vectors[:, :2], axis=1) * np.linalg.norm(orientation_vectors[ego_index, :2]))
-        # Split the x_y_cosine similarities into negative and positive groups
-        negative_group = np.where(x_y_cosine_similarities > 0)[0]
-        positive_group = np.where(x_y_cosine_similarities <= 0)[0]
-        # Use the cosine_similarity array to further sort within each group
-        negative_group_final = np.argsort(cosine_similarities[negative_group])[::-1]
-        positive_group_final = np.argsort(cosine_similarities[positive_group])[::-1]
-        # Combine the two sorted lists
-        combined_list = np.concatenate((positive_group[positive_group_final], negative_group[negative_group_final]))
-        
-        sorted_cams = list(np.take(all_cam_labels, combined_list))
-        sorted_cams.remove(ego_cam)
-        sorted_cams.insert(0,full_ego_cam_name)
-        cam_distances = {c: sorted_cams.index(c) for c in sorted_cams}
-        sorted_cams = sorted_cams[::-1]
-        return sorted_cams, cam_distances
 
     def precompute_windows(self):
         if not os.path.exists(self.window_csv_path):
@@ -283,20 +198,6 @@ class EgoExo4DDataLoader(Dataset):
         print(f"Number of {self.split} windows:")
         print(len(self.windows))
 
-    def get_view_idx(self, exo_cam):
-        if "aria" in exo_cam.lower():
-            assert self.multi_view_egoexo
-            return 0
-        return self.view_map[exo_cam]
-
-    def create_view_available_mask(self, exo_cams):
-        mask = torch.zeros(self.num_max_views * self.duration, dtype=torch.bool)
-        for cam in exo_cams:
-            start_idx = self.get_view_idx(cam) * self.duration
-            end_idx = start_idx + self.duration
-            mask[start_idx:end_idx] = True
-        return mask
-
     def create_valid_views_mask(self, exo_video_feats, pos_views, neg_views):
         max_views, seq_len, feat_dim = exo_video_feats.shape
         seq_mask = torch.zeros((max_views, seq_len), dtype=torch.bool)
@@ -333,13 +234,6 @@ class EgoExo4DDataLoader(Dataset):
         for t in range(start_sec, end_sec):
             tth_second_rank = target[str(t)]
             assert tth_second_rank is not None
-            if self.randomize_ranking:
-                values = list(tth_second_rank.values())
-                random.shuffle(values)
-                tth_second_rank = {str(i): values[i] for i in range(len(values))}
-            elif self.reverse_ranking:
-                reversed_values = list(tth_second_rank.values())[::-1]
-                tth_second_rank = {str(i): reversed_values[i] for i in range(len(reversed_values))}
             curr_view_rank = "ego" if ego_cam == exo_cam else self.find_key_by_value(tth_second_rank, exo_cam)
             per_second_views.append(curr_view_rank)
             if tth_second_rank:
@@ -373,54 +267,12 @@ class EgoExo4DDataLoader(Dataset):
                     return key
         return "unk" #TODO: Can move this function to utils
 
-    def get_same_view_neg_idxs(self, ego_vid_features, narration_features, unnorm_starts, unnorm_ends):
-        same_view_neg_indices = []
-        if len(narration_features) == 1:
-            # Calculate the relative start and end
-            rel_start = int(max(0, unnorm_starts[0]))
-            rel_end = int(min(self.duration - 1, unnorm_ends[0]))
-            for i in range(ego_vid_features.size(0)):
-                if rel_start <= i <= rel_end:
-                    # Current index is within the narration interval, choose outside
-                    if rel_start > 0 and rel_end < self.duration - 1:
-                        neg_idx = random.choice(list(range(0, rel_start)) + list(range(rel_end + 1, self.duration)))
-                    elif rel_start > 0:
-                        neg_idx = random.randint(0, rel_start - 1)
-                    elif rel_end < self.duration - 1:
-                        neg_idx = random.randint(rel_end + 1, self.duration - 1)
-                    else:
-                        neg_idx = random.randint(0, self.duration - 1)  # Fallback if no valid negative
-                else:
-                    # Current index is outside the narration interval, choose inside
-                    neg_idx = random.randint(rel_start, rel_end)
-                same_view_neg_indices.append(neg_idx)
-        else:
-            device = ego_vid_features.device
-            narration_features_tensor = torch.stack(narration_features).squeeze(1).to(device)
-            similarity_matrix = torch.mm(ego_vid_features, narration_features_tensor.t())
-            similarity_matrix = similarity_matrix / (
-                    ego_vid_features.norm(dim=1, keepdim=True) * narration_features_tensor.norm(dim=1).t()
-                )
-            #Find the index of the least similar narration for each video feature
-            least_sim_indices = similarity_matrix.argmin(dim=1)
-            for i, least_sim_idx in enumerate(least_sim_indices):
-                # Get the relative start and end for this narration
-                rel_start = int(max(0, unnorm_starts[least_sim_idx]))
-                rel_end = int(min(self.duration-1, unnorm_ends[least_sim_idx]))
-                # Randomly select an index within this interval
-                if rel_start <= rel_end:
-                    neg_idx = random.randint(rel_start, rel_end)
-                else:
-                    neg_idx = random.randint(0, self.duration-1)  # Fallback if interval is invalid
-                same_view_neg_indices.append(neg_idx)
-        return torch.tensor(same_view_neg_indices, dtype=torch.long)
-
     def __getitem__(self, idx):
         window = self.windows.iloc[idx]
         video_id, exo_cams, ego_cam, start_sec, end_sec = window['video_id'], window['exo_cam'], window['ego_cam'], window['start_sec'], window['end_sec']
         take_ego_id = f"{video_id}_{ego_cam}"
         narration_ids = window['narration_ids'].split(',')
-        exo_cams = ast.literal_eval(exo_cams) if self.multi_view else [exo_cams]
+        exo_cams = [exo_cams]
         
         # Load video features
         video_features_list = []
@@ -428,37 +280,9 @@ class EgoExo4DDataLoader(Dataset):
             take_exo_id = f"{video_id}_{exo_cam}"
             features = torch.load(os.path.join(self.video_feature_path, f"{take_exo_id}.pt"))[start_sec:end_sec]
             video_features_list.append(features)
-    
-        if self.multi_view:
-            full_video_feat_len = (self.num_max_views)*self.duration
-            video_features = torch.ones(full_video_feat_len, features.shape[-1])
-            for cam, feats in zip(exo_cams, video_features_list):
-                start_idx = self.get_view_idx(cam) * self.duration
-                end_idx = start_idx + self.duration
-            video_features[start_idx:end_idx,:] = feats
-        else:
-            video_features = torch.cat(video_features_list, dim=0)
 
-        #Pad single exo view according to multi-view setting for evaluating multi-view model on single-view inference mode
-        if self.multi_view_single_exo_inference:
-            assert len(exo_cams) == 1
-            index = self.get_view_idx(exo_cams[0])
-            rows_left = index * self.duration
-            rows_right = (self.num_max_views-index-1) * self.duration
-            l_pad = torch.ones(rows_left, video_features.shape[-1])
-            r_pad = torch.ones(rows_right, video_features.shape[-1])
-            video_features = torch.cat((l_pad, video_features, r_pad), dim=0)
-            single_exo_mask = torch.ones(self.num_max_views * self.duration, dtype=torch.bool)
-            exo_view_end_idx = rows_left + self.duration
-            single_exo_mask[rows_left:exo_view_end_idx] = False
-            #Mask is false where valid video features are, and True otherwise (padding mask format)
-            
-        exo_video_features, target, neg_target, valid_views_mask, per_second_views = self.get_exo_features_and_target(video_id, ego_cam, exo_cams[0], take_ego_id, start_sec, end_sec)
-        
-        #Load audio features if used
-        if self.use_audio:
-            full_audio_features = np.load(os.path.join(self.audio_feature_path, f"{take_exo_id}.npy"))
-            audio_features = torch.from_numpy(full_audio_features[start_sec:end_sec]).float()
+        video_features = torch.cat(video_features_list, dim=0)
+        #exo_video_features, target, neg_target, valid_views_mask, per_second_views = self.get_exo_features_and_target(video_id, ego_cam, exo_cams[0], take_ego_id, start_sec, end_sec)
         
         # Load narration features
         narration_features = []
@@ -470,52 +294,32 @@ class EgoExo4DDataLoader(Dataset):
                 print(f"Bad narration: {nid}")
 
         # Load metadata
-        #NOTE: Should we include a narration if its timestamp is in the range, or if it overlaps (start, end) interval is in the range?
         narrations = self.annotations[self.annotations['unique_narration_id'].isin(narration_ids)]
-        narration_texts, starts, ends, unnorm_starts, unnorm_ends = [], [], [], [], []
+        narration_texts, tokens, starts, ends  = [], [], [], []
         for _, row in narrations.iterrows():
+            #token = self.tokenizer(row['narration'], max_length=32, truncation=True)['input_ids']
+            sec_start = max((int(row['start_frame']) / self.fps) - start_sec, 0)
+            sec_end = min((int(row['end_frame']) / self.fps) - start_sec, self.duration)
+            #if isinstance(self.tokenizer, Word2VecTokenizer) and (sum(token) == 0):  # all words are stop words
+            #        break
             narration_texts.append(row['narration'])
-            sec_start = (int(row['start_frame']) / self.fps) - start_sec
-            sec_end = (int(row['end_frame']) / self.fps) - start_sec
-            unnorm_starts.append(sec_start)
-            unnorm_ends.append(sec_end)
-            norm_start = max(sec_start / self.duration, 0.0)
-            norm_end = min(sec_end / self.duration, 1.0)
-            starts.append(norm_start)
-            ends.append(norm_end)
+            #tokens.append(torch.tensor(token))
+            starts.append(sec_start)
+            ends.append(sec_end)
+
 
         #truncate the narrations if too many:
         narration_features = narration_features[:self.duration]
         narration_texts = narration_texts[:self.duration]
-        unnorm_starts = unnorm_starts[:self.duration]
-        unnorm_ends = unnorm_ends[:self.duration]
+        #unnorm_starts = unnorm_starts[:self.duration]
+        #unnorm_ends = unnorm_ends[:self.duration]
         starts = starts[:self.duration]
         ends = ends[:self.duration]
 
-        if self.same_view_negative:
-            #Load the ego video features
-            ego_features_vid_path = os.path.join(self.video_feature_path, f"{take_ego_id}.pt")
-            ego_vid_features = torch.load(ego_features_vid_path)[start_sec:end_sec]
-            same_view_neg_indxs = self.get_same_view_neg_idxs(ego_vid_features, 
-                                                              narration_features,
-                                                              unnorm_starts,
-                                                              unnorm_ends)
-
-        # Randomize the order of narrations if the flag is set
-        if self.randomize_narration_order:
-            combined = list(zip(narration_texts, starts, ends, narration_features))
-            random.shuffle(combined)
-            narration_texts, starts, ends, narration_features = zip(*combined)
-            narration_texts, starts, ends, narration_features = list(narration_texts), list(starts), list(ends), list(narration_features)
-
         padded_narration_features = torch.zeros(int(self.duration), 1, 4096) 
-        padded_starts = torch.zeros(int(self.duration),1)
-        padded_ends = torch.zeros(int(self.duration),1)
         narration_padding_mask = torch.ones(int(self.duration), dtype=torch.bool)
 
         if narration_features:
-            padded_starts[:len(narration_features)] = torch.tensor(starts).unsqueeze(1)
-            padded_ends[:len(narration_features)] = torch.tensor(ends).unsqueeze(1)
             padded_narration_features[:len(narration_features),::] = torch.stack(narration_features)
             narration_padding_mask[:len(narration_features)] = 0
         
@@ -523,39 +327,16 @@ class EgoExo4DDataLoader(Dataset):
                     "video_id": video_id, 
                     "exo_camera": exo_cams[0], 
                     "start_sec": start_sec,
-                    "per_second_views": per_second_views}
+                    #"per_second_views": per_second_views
+                    }
 
         output_dict = {
-            'video_features': video_features.squeeze(1),
-            'video_padding_mask': self.create_video_mask(exo_cams) if self.multi_view else
-             (single_exo_mask if self.multi_view_single_exo_inference else torch.zeros(video_features.size(0), dtype=torch.bool)),
+            'video': video_features.squeeze(1),
+            'padding_mask': torch.zeros(video_features.size(0)).long(),
+            'start': starts,
+            'end': ends,
             'narration_features': padded_narration_features.squeeze(1),
             'narration_padding_mask': narration_padding_mask,
-            'starts': padded_starts.squeeze(1),
-            'ends': padded_ends.squeeze(1),
             'metadata' : metadata
         }
-
-        if self.multi_view:
-                output_dict['view_available_mask'] = self.create_view_available_mask(exo_cams)
-        elif self.multi_view_single_exo_inference:
-                output_dict['view_available_mask'] = ~output_dict['video_padding_mask']
-
-        if self.use_audio:
-            output_dict['audio_padding_mask'] = torch.zeros(audio_features.size(0), dtype=torch.bool)
-            output_dict['audio_features'] = audio_features.squeeze(1)
-        
-        if self.use_distill_nce_loss:
-            output_dict['ego_video_features'] = exo_video_features.squeeze(1)
-            output_dict['view_rank_label'] = target
-            output_dict['view_rank_neg_label'] = neg_target
-            output_dict['valid_views_mask'] = valid_views_mask
-
-        if self.use_center_duration:
-            output_dict['mean'] = (output_dict['starts'] + output_dict['ends']) / 2
-            output_dict['duration'] = torch.abs(output_dict['ends']-output_dict['starts'])
-
-        if self.same_view_negative:
-            output_dict['same_view_neg_idxs'] = same_view_neg_indxs
-
         return output_dict

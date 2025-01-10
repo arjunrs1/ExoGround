@@ -12,7 +12,7 @@ import math
 import functools
 import torch.cuda.amp as amp 
 from config_egoexo4d import parse_args, set_path
-from loss_egoexo4d import get_loss, get_mask_from_time, get_text_pos, visualize
+from loss_egoexo4d import get_loss, get_mask_from_time, get_text_pos, visualize, save_features_to_dir
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
@@ -31,7 +31,7 @@ from utils.utils import AverageMeter, save_checkpoint, neq_load_customized, \
 calc_topk_accuracy, ProgressMeter, neq_load_customized, save_runtime_checkpoint, MovingAverage
 
 class CurriculumDistributedSampler(DistributedSampler):
-    def __init__(self, dataset, num_replicas=None, rank=None, shuffle=True, seed=0, curriculum_epoch=0, max_epochs=None, start_frac=0.25, end_epoch_frac=0.75):
+    def __init__(self, dataset, num_replicas=None, rank=None, shuffle=True, seed=0, curriculum_epoch=0, max_epochs=None, start_frac=0.50, end_epoch_frac=0.75):
         super().__init__(dataset, num_replicas=num_replicas, rank=rank, shuffle=False, seed=seed)
         self.shuffle = shuffle
         self.curriculum_epoch = curriculum_epoch
@@ -305,10 +305,41 @@ def evaluate(loader, model, device, epoch, args):
             progress.display(idx)
 
         # Visualization call
-        if rank == 0 and (args.visualize and idx % args.vis_freq == 0 and not vis_this_epoch):
+        if rank == 0 and (args.visualize and idx % args.vis_freq == 0):# and not vis_this_epoch):
             if args.model in ['grounding', 'joint']:
                 visualize(input_data, logits, args, epoch)
                 vis_this_epoch = True
+
+        if rank == 0 and args.save_features:
+            if args.use_distill_nce_loss:
+                output_target_features = []
+                # Iterate over each sample in the batch
+                for i in range(ego_seq.size(0)):
+                    sample_outputs = []
+                    # Iterate over each view
+                    for j in range(ego_seq.size(1)):
+                        view = ego_seq[i, j]
+                        # Check if the view is non-zero
+                        if view.abs().sum() > 0:
+                            # Reshape and pass through the model
+                            with torch.no_grad():
+                                low_dim_target = model.module.get_low_dim_target_features(
+                                    view.unsqueeze(0),  # Pass only the current view
+                                    torch.zeros(view.size(0), dtype=torch.bool).unsqueeze(0)
+                                )['low_dim_features']
+                            sample_outputs.append(low_dim_target.squeeze(0))  # Remove batch dimension if needed
+                        else:
+                            sample_outputs.append(torch.zeros((args.seq_len, args.feature_dim), device=view.device))
+                    # Stack the outputs for the current sample
+                    sample_outputs = torch.stack(sample_outputs)
+                    output_target_features.append(sample_outputs)
+                output_target_features = torch.stack(output_target_features)
+                #print("OUTPUT SHAPE:")
+                #print(output_target_features.shape)
+            else:
+                output_target_features = None
+            save_features_to_dir(input_data, logits, args, epoch, low_dim_target_features=output_target_features)
+            print(f"Saved output features to {args.log_path}")
 
     if rank == 0:
         print(f' * Loss {losses.avg:.4f}')
@@ -375,11 +406,15 @@ def get_dataset(args):
         num_max_views=args.num_max_views,
         randomize_narration_order=args.randomize_narration_order,
         curriculum_train=args.curriculum_train,
+        sorted_curr_train=args.sorted_curr_train,
         stitched_best_exo_distill=args.stitched_best_exo_distill,
         model=args.model,
         exo_mode=args.exos,
         minimum_four_exo_takes=args.minimum_four_exo_takes,
-        same_view_negative=args.same_view_negative)
+        same_view_negative=args.same_view_negative,
+        use_tf_video_features=args.use_tf_video_features,
+        reverse_ranking=args.reverse_ranking,
+        randomize_ranking=args.randomize_ranking)
     val_dataset = D(
         split="val",
         duration=args.seq_len,
@@ -396,9 +431,12 @@ def get_dataset(args):
         model=args.model,
         randomize_narration_order=False,
         minimum_four_exo_takes=args.minimum_four_exo_takes,
-        same_view_negative=args.same_view_negative)
+        same_view_negative=args.same_view_negative,
+        use_tf_video_features=args.use_tf_video_features,
+        reverse_ranking=args.reverse_ranking,
+        randomize_ranking=args.randomize_ranking)
 
-    if args.views == "all" and args.curriculum_train:
+    if args.views == "all" and args.curriculum_train and args.sorted_curr_train in ['sorted']:
         train_sampler = CurriculumDistributedSampler(train_dataset, num_replicas=args.world_size, rank=args.rank, max_epochs=args.epochs, start_frac=args.start_frac, end_epoch_frac=args.end_epoch_frac)
     else:
         train_sampler = DistributedSampler(train_dataset, num_replicas=args.world_size, rank=args.rank)
@@ -414,7 +452,7 @@ def get_dataset(args):
     print("Loading val dataset...")
     val_loader = DataLoaderBG(val_dataset,
         batch_size=args.batch_size, num_workers=args.num_workers,
-        collate_fn=val_dataset.collate_fn, pin_memory=True, drop_last=True, #TODO: Eventually revert this to drop_last=False, there was an issue with last batch that was causing issues
+        collate_fn=val_dataset.collate_fn, pin_memory=True, drop_last=True,
         shuffle=(val_sampler is None), sampler=val_sampler, 
     )
     return train_dataset, val_dataset, train_loader, val_loader, train_sampler
@@ -437,7 +475,10 @@ def get_test_dataset(args):
         model=args.model,
         randomize_narration_order=False,
         minimum_four_exo_takes=args.minimum_four_exo_takes,
-        same_view_negative=args.same_view_negative)
+        same_view_negative=args.same_view_negative,
+        use_tf_video_features=args.use_tf_video_features,
+        reverse_ranking=False,
+        randomize_ranking=False)
 
     test_sampler = DistributedSampler(test_dataset, num_replicas=args.world_size, rank=args.rank)
 
@@ -492,11 +533,18 @@ def main(args):
     if args.use_pairwise_distill_nce_loss:
         assert args.views == "multi"
 
+    if args.use_tf_video_features:
+        args.video_feature_dim = 768
+        assert not args.use_distill_nce_loss
+
     if args.model in ['view_invariant']:
         assert args.use_distill_nce_loss
 
     if args.model in ['grounding']:
         assert not args.use_distill_nce_loss
+
+    if args.only_same_view_negative:
+        assert args.same_view_negative
 
     if args.exos != "all":
         assert not args.use_distill_nce_loss #We shouldn't be distilling for the exos experiments
@@ -723,8 +771,6 @@ def main(args):
                 print(f'[Missing keys]:{"="*12}\n{chr(10).join(missing_keys)}\n{"="*20}')
             if len(unexpected_keys):
                 print(f'[Unexpected keys]:{"="*12}\n{chr(10).join(unexpected_keys)}\n{"="*20}')
-            # user_input = input('[WARNING] Non-Equal load for resuming training! continue? [y/n]')
-            # if user_input.lower() == 'n': sys.exit()
         
         if args.model in ['cotrain']:
             model_without_dp._copy_param()
@@ -751,28 +797,24 @@ def main(args):
     args.prof = None
     
     print('Main loop starts')
-    #moving_average = MovingAverage(size=10)  # Adjust size to your needs
-    #best_val_loss = float('inf')
-    #patience = 10
-    #epochs_no_improve = 0
     for epoch in range(args.start_epoch, args.epochs):
         np.random.seed(epoch)
         random.seed(epoch)
-        if args.views == "multi":
-            train_loader.dataset.set_phase(get_phase(epoch=epoch, total_epochs=args.epochs, num_phases=args.num_max_views, final_phase_proportion=args.final_phase_prop))
-        elif args.views == "all" and args.curriculum_train:
-            train_sampler.set_epoch(epoch)
+
+        #Curriculum learning updates
+        if args.model in ['joint'] and args.curriculum_train:
+            if args.sorted_curr_train in ['phased']:
+                train_loader.dataset.set_phase(get_phase(epoch=epoch, total_epochs=args.epochs, num_phases=4, final_phase_proportion=args.final_phase_prop))
+            elif args.views == "all" and args.sorted_curr_train in ['sorted']:
+                train_sampler.set_epoch(epoch)
+
         if args.distributed:
             dist.barrier()
         train_loss = train(train_loader, model, optimizer, lr_scheduler, grad_scaler, device, epoch, args)
         val_loss = evaluate(val_loader, model, device, epoch, args) 
 
-        #moving_average.update(val_loss)
-        #smoothed_val_loss = moving_average.average()
         if rank == 0 and ((epoch % args.eval_freq == 0) or (epoch == args.epochs - 1)):
-            is_best = val_loss < best_val_loss  #use val loss to determine is_best
-            #is_best = smoothed_val_loss < best_val_loss (REPLACE ABOVE LINE WITH THIS IF USING MOVING AVERAGE)
-            #if is_best:
+            is_best = val_loss < best_val_loss
             best_val_loss = min(val_loss, best_val_loss)
             state_dict = model_without_dp.state_dict()
             save_dict = {
@@ -784,11 +826,6 @@ def main(args):
             save_checkpoint(save_dict, is_best, args.eval_freq, 
                 filename=os.path.join(args.model_path, 'epoch%d.pth.tar' % epoch), 
                 keep_all=(args.model in ['cotrain']),)
-            #else:
-                #epochs_no_improve += 1
-                #if epochs_no_improve >= patience:
-                #    print(f"No improvement for {patience} consecutive evaluations.")
-                #    break  # Optionally stop training early
     if rank == 0:
         print('Training from ep %d to ep %d finished' % (args.start_epoch, args.epochs))
     dist.destroy_process_group()
