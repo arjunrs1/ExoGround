@@ -1,15 +1,13 @@
 #!/bin/bash
+#SBATCH --account=CCR24058
 #SBATCH --job-name=jnt_trn
-#SBATCH --output=/checkpoint/%u/slurm_logs/joint/train_joint_%j.out
-#SBATCH --error=/checkpoint/%u/slurm_logs/joint/train_joint_%j.out
-#SBATCH --partition=learnfair
-#SBATCH --nodes=8
+#SBATCH --output=/scratch/10323/asomaya1/exoground/outputs/train_joint_%j.out
+#SBATCH --error=/scratch/10323/asomaya1/exoground/outputs/train_joint_%j_err.out
+#SBATCH --partition=gh
+#SBATCH --nodes=2
+#SBATCH --ntasks=2
 #SBATCH --ntasks-per-node=1
-#SBATCH --gpus-per-node=8
-#SBATCH --cpus-per-task=80
-#SBATCH --exclusive
-#SBATCH --time=72:00:00
-#SBATCH --constraint=volta32gb
+#SBATCH --time=2:00:00
 
 if [ -z "$1" ]; then
     echo "Error: No prefix name provided."
@@ -18,9 +16,10 @@ if [ -z "$1" ]; then
 fi
 
 ### init virtual environment if needed
-source activate sounding_narrations
+module load gcc cuda
+source activate exoground
 
-srun --label torchrun --nproc_per_node=8 \
+srun --label torchrun --nproc_per_node=1 \
     main_egoexo4d_distributed.py \
     --batch_size 16 \
     --epochs 100 \

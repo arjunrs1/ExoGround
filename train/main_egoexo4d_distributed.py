@@ -358,13 +358,17 @@ def evaluate(loader, model, device, epoch, args):
 
 def setup(args):
     # Initialize distributed environment
-    args.distributed = int(os.environ.get('SLURM_JOB_NUM_NODES', "1")) > 1
+    #args.distributed = int(os.environ.get('SLURM_JOB_NUM_NODES', "1")) > 1
+    args.distributed = torch.distributed.is_available()
+    print(f"distributed available: {args.distributed}")
+    print("YES IT REACHED")
     if args.distributed:
         torch.distributed.init_process_group(backend='nccl')
         args.rank = torch.distributed.get_rank()
         args.world_size = torch.distributed.get_world_size()
-        torch.cuda.set_device(args.rank)
-        device = torch.device(f'cuda:{args.rank}')
+        local_rank = int(os.environ.get('LOCAL_RANK', args.rank % torch.cuda.device_count()))
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f'cuda:{local_rank}')
     else:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     # CUDA setting
@@ -387,8 +391,9 @@ def setup(args):
     args.log_path, args.model_path, args.exp_path = set_path(args)
 
     # tensorboard monitor in the background threads
-    writer_train = SummaryWriter(logdir=os.path.join(args.log_path, 'train'), flush_secs=60)
-    args.train_plotter = TB.PlotterThread(writer_train)
+    if args.rank == 0:
+        writer_train = SummaryWriter(logdir=os.path.join(args.log_path, 'train'), flush_secs=60)
+        args.train_plotter = TB.PlotterThread(writer_train)
     return device
 
 def get_dataset(args):

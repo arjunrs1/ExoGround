@@ -60,25 +60,42 @@ class EgoExo4DDataLoader(Dataset):
         self.reverse_ranking = reverse_ranking
         self.randomize_ranking = randomize_ranking
         self.fps = fps
-        self.base_path = '/private/home/arjunrs1/egoexo4d_features'
-        self.vid_feat_rel_path = "checkpoint/yalesong/EgoExo4D_EgoVLPv2_arxivC/extracted_features_egovlp2/EgoVLPv2_Pretraining_bs512-lr3e_5-Ep20"
-        self.split_path = f"/private/home/arjunrs1/exo_narration_grounding/splits/egoexo4d_splits/{split}.csv"
-        self.annotation_path = f'/private/home/arjunrs1/exo_narration_grounding/data_processing/time_interval_annotation_files/narration_annotations/{split}.csv'
-        self.keysteps_annotations_path = f'/private/home/arjunrs1/exo_narration_grounding/data_processing/time_interval_annotation_files/keystep_annotations/{split}.csv'
-        self.takes_path = "/datasets01/egoexo4d/v2/takes/"
-        self.camera_pose_train_path = "/datasets01/egoexo4d/v2/annotations/ego_pose/train/camera_pose"
-        self.camera_pose_val_path = "/datasets01/egoexo4d/v2/annotations/ego_pose/val/camera_pose"
-        self.camera_pose_test_path = "/datasets01/egoexo4d/v2/annotations/ego_pose/test/camera_pose"
+        self.base_path = '/scratch/projects/CCR24058/EgoExo4D/features/exo_ground_features'
+        self.vid_feat_rel_path = "egovlpv2_video_features"
+        self.split_path = f"/work/10323/asomaya1/vista/code/exo_narration_grounding/splits/egoexo4d_splits/{split}.csv"
+        self.annotation_path = f'/work/10323/asomaya1/vista/code/exo_narration_grounding/data_processing/time_interval_annotation_files/narration_annotations/{split}.csv'
+        self.keysteps_annotations_path = f'/work/10323/asomaya1/vista/code/exo_narration_grounding/data_processing/time_interval_annotation_files/keystep_annotations/{split}.csv'
+        self.takes_path = "/scratch/projects/CCR24058/EgoExo4D/takes.json"
+        self.camera_pose_train_path = "/scratch/projects/CCR24058/EgoExo4D/annotations/ego_pose/train/camera_pose"
+        self.camera_pose_val_path = "/scratch/projects/CCR24058/EgoExo4D/annotations/ego_pose/val/camera_pose"
+        self.camera_pose_test_path = "/scratch/projects/CCR24058/EgoExo4D/annotations/ego_pose/test/camera_pose"
         self.camera_rankings_path = os.path.join(self.base_path, "all_camera_rankings.json")
         self.best_exo_annotations_path = os.path.join(self.base_path, "best_exo_annotations.json")
+
+        with open(self.takes_path, "r") as f:
+            self.takes = json.load(f)
+
+        def map_take_name_to_filtered_video_keys(data_list):
+            take_to_video_keys = {}
+            for entry in data_list:
+                take_name = entry["take_name"]
+                video_keys = [
+                    key for key in entry["frame_aligned_videos"].keys()
+                    if (("cam" in key.lower()) or ("gp" in key.lower()))
+                ]
+                take_to_video_keys[take_name] = video_keys
+            return take_to_video_keys
+
+        self.takes_dict = map_take_name_to_filtered_video_keys(self.takes)
+         
 
         self.take_uid_cam_pose_split_map = {}
         for camera_path in [self.camera_pose_train_path, self.camera_pose_val_path, self.camera_pose_test_path]:
             for cam_file in os.listdir(camera_path):
                 self.take_uid_cam_pose_split_map[cam_file.split(".")[0]] = camera_path.split("/")[-2]
 
-        self.atomic_take_cam_map_train_path = f'/datasets01/egoexo4d/v2/annotations/atomic_descriptions_train.json'
-        self.atomic_take_cam_map_test_path = f'/datasets01/egoexo4d/v2/annotations/atomic_descriptions_val.json'
+        self.atomic_take_cam_map_train_path = f'/scratch/projects/CCR24058/EgoExo4D/annotations/atomic_descriptions_train.json'
+        self.atomic_take_cam_map_test_path = f'/scratch/projects/CCR24058/EgoExo4D/annotations/atomic_descriptions_val.json'
 
         with open(self.atomic_take_cam_map_train_path, "rb") as f:
             atomic_descriptions_train_data = json.load(f)
@@ -306,7 +323,8 @@ class EgoExo4DDataLoader(Dataset):
 
     def get_exo_features_and_target(self, video_id, ego_cam, exo_cam, take_ego_id, start_sec, end_sec):
         take_uid = self.split_data[self.split_data['take_name'] == video_id]['take_uid'].iloc[0]
-        exo_cams = ['ego'] + [cam.split(".")[0] for cam in os.listdir(os.path.join(self.takes_path, video_id, "frame_aligned_videos")) if (".mp4" in cam.lower()) and ("aria" not in cam.lower())]
+        exo_cams = ['ego'] + [cam.split(".")[0] for cam in self.takes_dict[video_id]]
+        #exo_cams = ['ego'] + [cam.split(".")[0] for cam in os.listdir(os.path.join(self.takes_path, video_id, "frame_aligned_videos")) if (".mp4" in cam.lower()) and ("aria" not in cam.lower())]
         
         if ego_cam != exo_cam:
             exo_cams.remove(exo_cam)
