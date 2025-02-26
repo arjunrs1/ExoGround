@@ -4,10 +4,10 @@
 #SBATCH --output=/scratch/10323/asomaya1/exoground/outputs/train_joint_%j.out
 #SBATCH --error=/scratch/10323/asomaya1/exoground/outputs/train_joint_%j_err.out
 #SBATCH --partition=gh
-#SBATCH --nodes=2
-#SBATCH --ntasks=2
+#SBATCH --nodes=16
+#SBATCH --ntasks=16
 #SBATCH --ntasks-per-node=1
-#SBATCH --time=2:00:00
+#SBATCH --time=48:00:00
 
 if [ -z "$1" ]; then
     echo "Error: No prefix name provided."
@@ -31,7 +31,7 @@ srun --label torchrun --nproc_per_node=1 \
     --minimum_four_exo_takes \
     --use_distill_nce_loss \
     --same_view_negative \
-    --reverse_ranking \
+    --curriculum_train \
     --name_prefix $1
 
 # --same_view_negative \

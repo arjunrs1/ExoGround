@@ -3,6 +3,7 @@ import numpy as np
 import pandas as pd
 from torch.utils.data import Dataset
 from torch.utils.data.dataloader import default_collate
+from collections import Counter
 import os
 import json
 import ast
@@ -63,8 +64,8 @@ class EgoExo4DDataLoader(Dataset):
         self.base_path = '/scratch/projects/CCR24058/EgoExo4D/features/exo_ground_features'
         self.vid_feat_rel_path = "egovlpv2_video_features"
         self.split_path = f"/work/10323/asomaya1/vista/code/exo_narration_grounding/splits/egoexo4d_splits/{split}.csv"
-        self.annotation_path = f'/work/10323/asomaya1/vista/code/exo_narration_grounding/data_processing/time_interval_annotation_files/narration_annotations/{split}.csv'
-        self.keysteps_annotations_path = f'/work/10323/asomaya1/vista/code/exo_narration_grounding/data_processing/time_interval_annotation_files/keystep_annotations/{split}.csv'
+        self.annotation_path = f'/work/10323/asomaya1/vista/code/exo_narration_grounding/data_processing/time_interval_annotation_files/egoexo4d/narration_annotations/{split}.csv'
+        self.keysteps_annotations_path = f'/work/10323/asomaya1/vista/code/exo_narration_grounding/data_processing/time_interval_annotation_files/egoexo4d/keystep_annotations/{split}.csv'
         self.takes_path = "/scratch/projects/CCR24058/EgoExo4D/takes.json"
         self.camera_pose_train_path = "/scratch/projects/CCR24058/EgoExo4D/annotations/ego_pose/train/camera_pose"
         self.camera_pose_val_path = "/scratch/projects/CCR24058/EgoExo4D/annotations/ego_pose/val/camera_pose"
@@ -537,11 +538,24 @@ class EgoExo4DDataLoader(Dataset):
             padded_narration_features[:len(narration_features),::] = torch.stack(narration_features)
             narration_padding_mask[:len(narration_features)] = 0
         
+        narr_ranks = []
+        for i, row in enumerate(narration_features):
+            stard_vid_idx = int(starts[i]*self.duration)
+            end_vid_idx = min(int(ends[i]*self.duration)+1, self.duration-1)
+            curr_narr_ranks = per_second_views[stard_vid_idx:end_vid_idx]
+            narr_rank_view_counter = Counter(curr_narr_ranks)
+            if curr_narr_ranks == []:
+                final_narr_rank = "unk"
+            else:
+                final_narr_rank = max(curr_narr_ranks, key=narr_rank_view_counter.get)
+            narr_ranks.append(final_narr_rank)
+
         metadata = {"narrations": narration_texts, 
                     "video_id": video_id, 
                     "exo_camera": exo_cams[0], 
                     "start_sec": start_sec,
-                    "per_second_views": per_second_views}
+                    "per_second_views": per_second_views,
+                    "narr_ranks": narr_ranks}
 
         output_dict = {
             'video_features': video_features.squeeze(1),

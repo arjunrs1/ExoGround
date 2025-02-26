@@ -298,7 +298,8 @@ def evaluate(loader, model, device, epoch, args):
                         'loss_dict': ious.cpu().detach().tolist(),
                         'metadata': {"narration": input_data['metadata']['narrations'], 
                                     "video_id": input_data['metadata']['video_id'],
-                                    "cam_id": input_data['metadata']['exo_camera']}
+                                    "cam_id": input_data['metadata']['exo_camera'],
+                                    "narr_ranks": input_data['metadata']['narr_ranks']}
                     })
 
         if (rank == 0) and (idx % args.print_freq == 0):
