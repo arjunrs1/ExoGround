@@ -1,5 +1,6 @@
 import os
 import sys
+import argparse
 import torch
 from torch.utils import data 
 from tensorboardX import SummaryWriter
@@ -10,8 +11,10 @@ import json
 import time
 import math
 import functools
-import torch.cuda.amp as amp 
-from config_egoexo4d import parse_args, set_path
+import torch.cuda.amp as amp
+import importlib 
+import config_egoexo4d
+import config_lemma
 from loss_egoexo4d import get_loss, get_mask_from_time, get_text_pos, visualize, save_features_to_dir
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -19,6 +22,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 sys.path.append('../data/')
 from data.loader_egoexo4d import EgoExo4DDataLoader
+from data.loader_lemma import LemmaDataLoader
 sys.path.append('../model/')
 from model.exo_ground_model import ExoGroundingTransformer
 from model.keystep_ground_model import GroundingModel
@@ -299,7 +303,7 @@ def evaluate(loader, model, device, epoch, args):
                         'metadata': {"narration": input_data['metadata']['narrations'], 
                                     "video_id": input_data['metadata']['video_id'],
                                     "cam_id": input_data['metadata']['exo_camera'],
-                                    "narr_ranks": input_data['metadata']['narr_ranks']}
+                                    "narr_ranks": input_data['metadata']['narr_ranks'] if args.dataset == "egoexo4d" else None}
                     })
 
         if (rank == 0) and (idx % args.print_freq == 0):
@@ -357,12 +361,10 @@ def evaluate(loader, model, device, epoch, args):
     else:
         return losses.avg
 
-def setup(args):
+def setup(args, set_path):
     # Initialize distributed environment
     #args.distributed = int(os.environ.get('SLURM_JOB_NUM_NODES', "1")) > 1
     args.distributed = torch.distributed.is_available()
-    print(f"distributed available: {args.distributed}")
-    print("YES IT REACHED")
     if args.distributed:
         torch.distributed.init_process_group(backend='nccl')
         args.rank = torch.distributed.get_rank()
@@ -398,49 +400,76 @@ def setup(args):
     return device
 
 def get_dataset(args):
-    D = EgoExo4DDataLoader
-    train_dataset = D(
-        split="train",
-        duration=args.seq_len,
-        hop_length=args.seq_hop,
-        use_audio=args.use_audio,
-        use_keysteps=args.use_keysteps,
-        views=args.views,
-        use_distill_nce_loss=args.use_distill_nce_loss,
-        use_center_duration=args.use_center_duration,
-        multi_view_egoexo=args.multi_view_egoexo,
-        num_max_views=args.num_max_views,
-        randomize_narration_order=args.randomize_narration_order,
-        curriculum_train=args.curriculum_train,
-        sorted_curr_train=args.sorted_curr_train,
-        stitched_best_exo_distill=args.stitched_best_exo_distill,
-        model=args.model,
-        exo_mode=args.exos,
-        minimum_four_exo_takes=args.minimum_four_exo_takes,
-        same_view_negative=args.same_view_negative,
-        use_tf_video_features=args.use_tf_video_features,
-        reverse_ranking=args.reverse_ranking,
-        randomize_ranking=args.randomize_ranking)
-    val_dataset = D(
-        split="val",
-        duration=args.seq_len,
-        hop_length=args.seq_hop,
-        use_audio=args.use_audio,
-        use_keysteps=args.use_keysteps,
-        views="exo" if args.model in ['grounding', 'joint'] else "all",
-        use_distill_nce_loss=args.use_distill_nce_loss,
-        use_center_duration=args.use_center_duration,
-        multi_view_single_exo_inference=(args.views=="multi"),
-        multi_view_egoexo=args.multi_view_egoexo,
-        num_max_views=args.num_max_views,
-        stitched_best_exo_distill=True if args.model in ['view_invariant'] else False, #TODO: Is this right??? Should we be fixing best_exo_distill in VI evaluation?
-        model=args.model,
-        randomize_narration_order=False,
-        minimum_four_exo_takes=args.minimum_four_exo_takes,
-        same_view_negative=args.same_view_negative,
-        use_tf_video_features=args.use_tf_video_features,
-        reverse_ranking=args.reverse_ranking,
-        randomize_ranking=args.randomize_ranking)
+    if args.dataset == "egoexo4d":
+        D = EgoExo4DDataLoader
+        train_dataset = D(
+            split="train",
+            duration=args.seq_len,
+            hop_length=args.seq_hop,
+            use_audio=args.use_audio,
+            use_keysteps=args.use_keysteps,
+            views=args.views,
+            use_distill_nce_loss=args.use_distill_nce_loss,
+            use_center_duration=args.use_center_duration,
+            multi_view_egoexo=args.multi_view_egoexo,
+            num_max_views=args.num_max_views,
+            randomize_narration_order=args.randomize_narration_order,
+            curriculum_train=args.curriculum_train,
+            sorted_curr_train=args.sorted_curr_train,
+            stitched_best_exo_distill=args.stitched_best_exo_distill,
+            model=args.model,
+            exo_mode=args.exos,
+            minimum_four_exo_takes=args.minimum_four_exo_takes,
+            same_view_negative=args.same_view_negative,
+            use_tf_video_features=args.use_tf_video_features,
+            reverse_ranking=args.reverse_ranking,
+            randomize_ranking=args.randomize_ranking,
+            exo_exo_distill=args.exo_exo_distill)
+        val_dataset = D(
+            split="val",
+            duration=args.seq_len,
+            hop_length=args.seq_hop,
+            use_audio=args.use_audio,
+            use_keysteps=args.use_keysteps,
+            views="exo" if args.model in ['grounding', 'joint'] else "all",
+            use_distill_nce_loss=args.use_distill_nce_loss,
+            use_center_duration=args.use_center_duration,
+            multi_view_single_exo_inference=(args.views=="multi"),
+            multi_view_egoexo=args.multi_view_egoexo,
+            num_max_views=args.num_max_views,
+            stitched_best_exo_distill=True if args.model in ['view_invariant'] else False, #TODO: Is this right??? Should we be fixing best_exo_distill in VI evaluation?
+            model=args.model,
+            randomize_narration_order=False,
+            minimum_four_exo_takes=args.minimum_four_exo_takes,
+            same_view_negative=args.same_view_negative,
+            use_tf_video_features=args.use_tf_video_features,
+            reverse_ranking=args.reverse_ranking,
+            randomize_ranking=args.randomize_ranking,
+            exo_exo_distill=args.exo_exo_distill)
+    elif args.dataset == "lemma":
+        D = LemmaDataLoader
+        train_dataset = D(
+            split='train',
+            duration=args.seq_len,
+            hop_length=args.seq_hop,
+            views=args.views,
+            use_distill_nce_loss=args.use_distill_nce_loss,
+            curriculum_train=args.curriculum_train,
+            same_view_negative=args.same_view_negative,
+            use_tf_video_features=args.use_tf_video_features,
+            reverse_ranking=args.reverse_ranking,
+            randomize_ranking=args.randomize_ranking)
+        val_dataset = D(
+            split='val',
+            duration=args.seq_len,
+            hop_length=args.seq_hop,
+            views="exo", #TODO: is this corrrect?
+            use_distill_nce_loss=args.use_distill_nce_loss,
+            curriculum_train=args.curriculum_train,
+            same_view_negative=args.same_view_negative,
+            use_tf_video_features=args.use_tf_video_features,
+            reverse_ranking=args.reverse_ranking,
+            randomize_ranking=args.randomize_ranking)
 
     if args.views == "all" and args.curriculum_train and args.sorted_curr_train in ['sorted']:
         train_sampler = CurriculumDistributedSampler(train_dataset, num_replicas=args.world_size, rank=args.rank, max_epochs=args.epochs, start_frac=args.start_frac, end_epoch_frac=args.end_epoch_frac)
@@ -464,27 +493,42 @@ def get_dataset(args):
     return train_dataset, val_dataset, train_loader, val_loader, train_sampler
 
 def get_test_dataset(args):
-    D = EgoExo4DDataLoader
-    test_dataset = D(
-        split="test",
-        duration=args.seq_len,
-        hop_length=args.seq_hop,
-        use_audio=args.use_audio,
-        use_keysteps=args.use_keysteps,
-        views="exo" if args.model in ['grounding', 'joint'] else "all", #fix testing on all exo views
-        use_distill_nce_loss=args.use_distill_nce_loss,
-        use_center_duration=args.use_center_duration,
-        multi_view_single_exo_inference=(args.views=="multi"),
-        multi_view_egoexo=args.multi_view_egoexo,
-        num_max_views=args.num_max_views,
-        stitched_best_exo_distill=True if args.model in ['view_invariant'] else False,
-        model=args.model,
-        randomize_narration_order=False,
-        minimum_four_exo_takes=args.minimum_four_exo_takes,
-        same_view_negative=args.same_view_negative,
-        use_tf_video_features=args.use_tf_video_features,
-        reverse_ranking=False,
-        randomize_ranking=False)
+    if args.dataset == "egoexo4d":
+        D = EgoExo4DDataLoader
+        test_dataset = D(
+            split="test",
+            duration=args.seq_len,
+            hop_length=args.seq_hop,
+            use_audio=args.use_audio,
+            use_keysteps=args.use_keysteps,
+            views="exo" if args.model in ['grounding', 'joint'] else "all", #fix testing on all exo views
+            use_distill_nce_loss=args.use_distill_nce_loss,
+            use_center_duration=args.use_center_duration,
+            multi_view_single_exo_inference=(args.views=="multi"),
+            multi_view_egoexo=args.multi_view_egoexo,
+            num_max_views=args.num_max_views,
+            stitched_best_exo_distill=True if args.model in ['view_invariant'] else False,
+            model=args.model,
+            randomize_narration_order=False,
+            minimum_four_exo_takes=args.minimum_four_exo_takes,
+            same_view_negative=args.same_view_negative,
+            use_tf_video_features=args.use_tf_video_features,
+            reverse_ranking=False,
+            randomize_ranking=False,
+            exo_exo_distill=args.exo_exo_distill)
+    else:
+        D = LemmaDataLoader
+        test_dataset = D(
+            split='test',
+            duration=args.seq_len,
+            hop_length=args.seq_hop,
+            views="exo",
+            use_distill_nce_loss=args.use_distill_nce_loss,
+            curriculum_train=args.curriculum_train,
+            same_view_negative=args.same_view_negative,
+            use_tf_video_features=args.use_tf_video_features,
+            reverse_ranking=False,
+            randomize_ranking=False)
 
     test_sampler = DistributedSampler(test_dataset, num_replicas=args.world_size, rank=args.rank)
 
@@ -526,8 +570,8 @@ def optim_policy(model, args, policy='default'):
     return params
 
 
-def main(args):
-    device = setup(args)
+def main(args, set_path):
+    device = setup(args, set_path)
     rank = args.rank
     # pre-setup: overwritting
     if args.model == 'grounding':
@@ -810,6 +854,7 @@ def main(args):
         #Curriculum learning updates
         if args.model in ['joint'] and args.curriculum_train:
             if args.sorted_curr_train in ['phased']:
+                num_phases = 4 if args.dataset == "egoexo4d" else 1
                 train_loader.dataset.set_phase(get_phase(epoch=epoch, total_epochs=args.epochs, num_phases=4, final_phase_proportion=args.final_phase_prop))
             elif args.views == "all" and args.sorted_curr_train in ['sorted']:
                 train_sampler.set_epoch(epoch)
@@ -845,12 +890,32 @@ def get_model_card(tag):
         print(f'getting model tag {tag}: {model_card_dict[tag]}')
     return model_card_dict.get(tag, tag)
 
+def get_dataset_parser():
+    """Determine which dataset's parse_args to use."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset", type=str, required=True, choices=["egoexo4d", "lemma"],
+                        help="Specify which dataset configuration to use.")
+    
+    # Only parse known args, preventing conflict with other config parsers
+    args, _ = parser.parse_known_args()
+    
+    # Return the correct parse_args function
+    if args.dataset == "egoexo4d":
+        config_module = importlib.import_module("config_egoexo4d")
+    elif args.dataset == "lemma":
+        config_module = importlib.import_module("config_lemma")
+    else:
+        raise ValueError(f"Unknown dataset: {args.dataset}")
+
+    return config_module.parse_args, config_module.set_path  # Return both functions
+
 
 if __name__ == "__main__":
+    parse_args, set_path = get_dataset_parser()
     args = parse_args()
     args.rank = int(os.environ['RANK'])
     args.world_size = int(os.environ['WORLD_SIZE'])
-    main(args)
+    main(args, set_path)
 
 """
 train keysteps:

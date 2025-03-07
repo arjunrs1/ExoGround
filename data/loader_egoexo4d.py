@@ -36,6 +36,7 @@ class EgoExo4DDataLoader(Dataset):
                 use_tf_video_features=False,
                 reverse_ranking=False,
                 randomize_ranking=False,
+                exo_exo_distill=False,
                 fps=30):
         self.split = split
         self.duration = duration
@@ -60,6 +61,7 @@ class EgoExo4DDataLoader(Dataset):
         self.use_tf_video_features = use_tf_video_features
         self.reverse_ranking = reverse_ranking
         self.randomize_ranking = randomize_ranking
+        self.exo_exo_distill = exo_exo_distill
         self.fps = fps
         self.base_path = '/scratch/projects/CCR24058/EgoExo4D/features/exo_ground_features'
         self.vid_feat_rel_path = "egovlpv2_video_features"
@@ -371,6 +373,11 @@ class EgoExo4DDataLoader(Dataset):
                     else:
                         best_view_rank = 0 if int(curr_view_rank) != 0 else -1
                         # best_view_rank = -1 #NOTE: uncomment this line to switch to Ego-best (and above too)
+                    if self.exo_exo_distill and best_view_rank == -1:
+                        for r, name in tth_second_rank.items():
+                            if name in exo_cams:
+                                best_view_rank = int(r)
+                                break
                     best_view = "ego" if best_view_rank == -1 else tth_second_rank[str(best_view_rank)]
                 best_view_idx = exo_cams.index(best_view)
                 worst_view_rank = np.array([int(v) for v in list(tth_second_rank.keys())]).max()

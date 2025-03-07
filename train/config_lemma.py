@@ -10,7 +10,7 @@ def parse_args():
     parser.add_argument('--language_model', default='word2vec', type=str)
     parser.add_argument('--dataset', default='egoexo4d', type=str)
     parser.add_argument('--seq_len', default=64, type=int)
-    parser.add_argument('--seq_hop', default=5, type=int)
+    parser.add_argument('--seq_hop', default=2, type=int)
     parser.add_argument('--batch_size', default=64, type=int)
     parser.add_argument('--loss', default='iou_l1', type=str)
     parser.add_argument('--lr', default=1e-4, type=float)
@@ -60,7 +60,7 @@ def parse_args():
     parser.add_argument('--pairwise_distill_mode', default='all', choices=['all', 'unmasked'], type=str)
     parser.add_argument('--use_center_duration', action='store_true', default=True)
     parser.add_argument('--views', default='all', choices=['exo', 'ego', 'all', 'multi'], type=str)
-    parser.add_argument('--num_max_views', default=4, type=int) #6 for EgoExo4D
+    parser.add_argument('--num_max_views', default=2, type=int) #6 for EgoExo4D
     parser.add_argument('--multi_view_egoexo', action='store_true', default=False)
     parser.add_argument('--randomize_narration_order', action='store_true', default=False)
     parser.add_argument('--final_phase_prop', default=0.3, type=float)
@@ -74,7 +74,7 @@ def parse_args():
     parser.add_argument('--only_same_view_negative', action='store_true', default=False)
     parser.add_argument('--reverse_ranking', action='store_true', default=False)
     parser.add_argument('--randomize_ranking', action='store_true', default=False)
-    parser.add_argument('--exo_exo_distill', action='store_true', default=False)
+
     #data dimensions
     parser.add_argument('--video_feature_dim', default=4096, type=int)
     parser.add_argument('--text_feature_dim', default=4096, type=int)
